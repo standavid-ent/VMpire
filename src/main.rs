@@ -26,9 +26,12 @@ macro_rules! log {
 }
 
 mod bring_up;
+mod hal;
+mod host;
+mod hv;
 mod output;
 mod resident;
-mod vmx;
+mod x86;
 
 // The UART driver, shared with the tools (`crates/uart`); imported here so
 // the rest of Aleph0 reaches it as `crate::port`, `crate::serial` and

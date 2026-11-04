@@ -1,0 +1,225 @@
+//! The VM-exit entry: the exit stack, the assembly entry stub, and the
+//! VMREAD helper the exit path uses (Intel only).
+//!
+//! On every VM exit the CPU loads host state from the VMCS and jumps to
+//! HOST_RIP ([`entry_address`]) with RSP = HOST_RSP ([`VmExitStack::top`]).
+//! Nothing else is set up for us: interrupts are off (host RFLAGS is forced
+//! to 0x2), and the guest's general-purpose registers are still live in the
+//! CPU, so the stub saves them before any Rust code can clobber them. The
+//! stub then calls the shared exit handler (`hv::vmexit`), and resumes or
+//! stops the guest as it says. A stop's dump of the guest's VMCS state is
+//! `dump.rs`.
+use core::ptr::NonNull;
+
+use crate::hal::intel::vmcs::{self, VmcsError};
+use crate::x86::page::{PAGE_SIZE, allocate_zeroed_pages};
+
+pub(crate) mod dump;
+
+/// VMREADs `field` of the current VMCS. For the exit handler and its
+/// reports, which run in exit context only.
+pub(crate) fn read_field(field: u32) -> Result<u64, VmcsError> {
+    // SAFETY: exit context: VMX root operation, with the guest's VMCS
+    // current.
+    unsafe { vmcs::vmread(field) }
+}
+
+/// 64 KiB. A debug build's exits used 21168 bytes on Hyper-V (an MTRR write
+/// that retypes EPT), more than the 16 KiB this once was: nothing guards the
+/// page below the stack, so the handler ran on into the guest's data page.
+pub const VM_EXIT_STACK_PAGES: usize = 16;
+pub const VM_EXIT_STACK_SIZE: usize = VM_EXIT_STACK_PAGES * PAGE_SIZE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmExitStackError {
+    /// Failed to allocate memory for the VM-exit stack.
+    AllocationFailed,
+}
+
+/// Owns a contiguous stack allocation that must outlive every use of HOST_RSP.
+pub struct VmExitStack {
+    base: NonNull<u8>,
+}
+
+impl VmExitStack {
+    /// Allocate a zeroed, page-aligned stack for the host VM-exit path.
+    pub fn allocate() -> Result<Self, VmExitStackError> {
+        let base = allocate_zeroed_pages(VM_EXIT_STACK_PAGES, VmExitStackError::AllocationFailed)?;
+        Ok(Self { base })
+    }
+
+    /// Top of the downward-growing stack, for HOST_RSP. The x64 calling
+    /// convention the entry stub follows needs it 16-byte aligned.
+    pub fn top(&self) -> u64 {
+        // SAFETY: the allocation is VM_EXIT_STACK_SIZE bytes long, so this is
+        // one past its end, which `add` allows.
+        let top = unsafe { self.base.as_ptr().add(VM_EXIT_STACK_SIZE) } as usize;
+        assert_eq!(top % 16, 0);
+        top as u64
+    }
+
+    /// How many bytes of the stack the exit handler has written, from the
+    /// top down to the lowest nonzero word ([`used_bytes`]). The whole size
+    /// means the lowest word was written, which an overflow into the page
+    /// below does on its way.
+    ///
+    /// # Safety
+    ///
+    /// No exit handler may be running on the stack: the guest has stopped.
+    pub unsafe fn used(&self) -> usize {
+        // SAFETY: the allocation is VM_EXIT_STACK_SIZE bytes, page-aligned,
+        // and the caller guarantees nothing writes it meanwhile.
+        let words = unsafe {
+            core::slice::from_raw_parts(self.base.as_ptr().cast::<u64>(), VM_EXIT_STACK_SIZE / size_of::<u64>())
+        };
+        used_bytes(words)
+    }
+}
+
+/// Bytes from the lowest nonzero word of `words`, a stack that started
+/// zeroed, to its top. A word the handler wrote as zero counts as unused,
+/// so this can undercount by the few words below the deepest nonzero one.
+fn used_bytes(words: &[u64]) -> usize {
+    words
+        .iter()
+        .position(|&word| word != 0)
+        .map_or(0, |lowest| (words.len() - lowest) * size_of::<u64>())
+}
+
+#[repr(C)]
+pub(crate) struct RegisterFrame {
+    pub(crate) rax: u64,
+    pub(crate) rbx: u64,
+    pub(crate) rcx: u64,
+    pub(crate) rdx: u64,
+    pub(crate) rsi: u64,
+    pub(crate) rdi: u64,
+    pub(crate) rbp: u64,
+    pub(crate) r8: u64,
+    pub(crate) r9: u64,
+    pub(crate) r10: u64,
+    pub(crate) r11: u64,
+    pub(crate) r12: u64,
+    pub(crate) r13: u64,
+    pub(crate) r14: u64,
+    pub(crate) r15: u64,
+}
+
+// The entry stub pushes r15 first and rax last, so rax ends up at the lowest
+// address. Tie the struct layout to that order, so reordering a field or a
+// push breaks the build instead of silently mixing up guest registers.
+const _: () = {
+    assert!(core::mem::size_of::<RegisterFrame>() == 15 * 8);
+    assert!(core::mem::offset_of!(RegisterFrame, rax) == 0);
+    assert!(core::mem::offset_of!(RegisterFrame, r15) == 14 * 8);
+};
+
+// Every exit enters here with RSP = HOST_RSP, the top of the exit stack, so
+// the stack starts empty on each exit and does not grow across exits.
+//
+// Stack alignment (Microsoft x64 ABI: RSP is a multiple of 16 at each
+// `call`): HOST_RSP is 16-aligned; 15 pushes take 120 bytes, and 40 more
+// (32 bytes of shadow space plus 8 of padding) make 160, a multiple of 16.
+// After the 15 pops RSP is HOST_RSP again, and the failure path pushes the
+// same 15 registers, so the same 40 bytes align its call too.
+//
+// Only the 15 general-purpose registers are saved, because nothing here
+// touches vector state: the x86_64-unknown-uefi target is soft-float with
+// MMX/SSE disabled (only `fxsr` is among its vector features), so the handler
+// and `core::fmt` never use x87, XMM or MXCSR. If SSE target features are ever
+// enabled, the handler would clobber the guest's vector registers, and this
+// stub would have to save them (for example with FXSAVE/FXRSTOR) before an OS
+// guest can run.
+core::arch::global_asm!(
+    r#"
+    .globl vmexit_entry
+vmexit_entry:
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
+
+    mov rcx, rsp
+    sub rsp, 40
+    cld
+    call vmexit_handler
+
+    // RAX = 0: resume the guest. Anything else is a stop value: return it
+    // from vmx_launch (vmx/vmcs/launch.rs), abandoning this stack. Only the
+    // test guest's stops get here; the firmware's halt in the handler.
+    test rax, rax
+    jnz vmx_return_to_launcher
+
+    // Resume: restore the guest's registers in the reverse order of the
+    // pushes above; RIP, RSP and RFLAGS come from the VMCS, not from this
+    // frame.
+    add rsp, 40
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+    vmresume
+
+    // Reached only if VMRESUME failed; RFLAGS say how. The guest's
+    // registers are still live: push them again as a RegisterFrame for the
+    // stop's dump. PUSH leaves RFLAGS alone, so PUSHFQ still reads what
+    // VMRESUME left. vmresume_failed(rflags = RCX, frame = RDX) returns the
+    // stop value in RAX.
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
+    pushfq
+    pop rcx
+    mov rdx, rsp
+    sub rsp, 40
+    call vmresume_failed
+    jmp vmx_return_to_launcher
+"#
+);
+
+unsafe extern "C" {
+    fn vmexit_entry() -> !;
+}
+
+/// The address of the entry stub, for HOST_RIP.
+pub fn entry_address() -> u64 {
+    vmexit_entry as *const () as usize as u64
+}
+
+#[cfg(test)]
+#[path = "../../../../tests/unit/hal/intel/vmexit.rs"]
+mod tests;

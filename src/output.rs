@@ -48,7 +48,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     crate::serial_println!("{} PANIC: {info}", crate::TAG);
     // What led here, if the guest ran: its last VM exits. After the message,
     // so the message is out even if this goes wrong.
-    crate::vmx::vmexit::report_exit_history(format_args!("PANIC"));
+    crate::hv::vmexit::report_exit_history(format_args!("PANIC"));
 
     // Firmware console: only in the boot-services phase. In the VM-exit
     // handler or after `ExitBootServices` the message goes to serial alone.
@@ -62,7 +62,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// Stops this CPU permanently, with interrupts disabled.
 ///
 /// Used wherever execution must end without firmware help: after a panic,
-/// after an exception in VMX root operation (`vmx::host`), and after a stop
+/// after an exception in VMX root operation (`crate::host`), and after a stop
 /// of the firmware guest, which has nothing to return to. The test guest's
 /// stop does not halt; the VM-exit handler hands it back to bring-up.
 ///

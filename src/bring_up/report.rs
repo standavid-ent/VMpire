@@ -6,20 +6,19 @@
 use uefi::boot::MemoryType;
 
 use super::PassthroughState;
-use crate::vmx;
-use crate::vmx::apic::{ApicBase, LAPIC_VERSION};
-use crate::vmx::cr::CrControls;
-use crate::vmx::ept::{Ept, EptSupport, Hidden, TypeTables, WalkEnd};
-use crate::vmx::exit_bitmaps::{ExitBitmaps, intercepted};
-use crate::vmx::features::{GuestFeatures, HiddenCpuid};
-use crate::vmx::guest::{GuestMappings, GuestMemory};
-use crate::vmx::guest_state::{GuestEntry, GuestState};
-use crate::vmx::host::{HostEnvironment, InterruptStack};
-use crate::vmx::hyperv::{Detection, INTERFACE_LEAF, SYNTHETIC_MSRS, VENDOR_LEAF};
-use crate::vmx::msr::VmcsControlMsrs;
-use crate::vmx::mtrr::{MtrrCapabilities, MtrrError, MtrrRegisters, Mtrrs};
-use crate::vmx::page::Allocation;
-use crate::vmx::vmcs::GuestKind;
+use crate::hal::intel::ept::{Ept, EptSupport, Hidden, TypeTables, WalkEnd};
+use crate::hal::intel::exit_bitmaps::{ExitBitmaps, intercepted};
+use crate::hal::intel::guest_state::{GuestEntry, GuestState};
+use crate::hal::intel::vmcs::GuestKind;
+use crate::host::{HostEnvironment, InterruptStack};
+use crate::hv::features::{GuestFeatures, HiddenCpuid};
+use crate::hv::guest::{GuestMappings, GuestMemory};
+use crate::hv::hyperv::{Detection, INTERFACE_LEAF, SYNTHETIC_MSRS, VENDOR_LEAF};
+use crate::x86::apic::{ApicBase, LAPIC_VERSION};
+use crate::x86::cr::CrControls;
+use crate::x86::msr::VmcsControlMsrs;
+use crate::x86::mtrr::{MtrrCapabilities, MtrrError, MtrrRegisters, Mtrrs};
+use crate::x86::page::Allocation;
 
 /// Prints the segmentation state of the context tables, which the guest
 /// state copies and the host GDT keeps the selectors of.
@@ -28,7 +27,7 @@ use crate::vmx::vmcs::GuestKind;
 pub(super) fn segment_state() {
     // SAFETY: the context GDT is live (activated by bring-up, never freed), and
     // UEFI runs in long mode.
-    let state = unsafe { vmx::segment::read_all() };
+    let state = unsafe { crate::x86::segment::read_all() };
 
     log!(
         "segments: cs={:#06x} ss={:#06x} ds={:#06x} es={:#06x} fs={:#06x} gs={:#06x} tr={:#06x}",
@@ -111,7 +110,7 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     log!(
         "VMX BASIC={:#018x}; true controls={}",
         controls.basic,
-        controls.basic & vmx::msr::VMX_BASIC_TRUE_CONTROLS != 0,
+        controls.basic & crate::x86::msr::VMX_BASIC_TRUE_CONTROLS != 0,
     );
     for (name, capability) in [
         ("pin", controls.pinbased),
@@ -133,7 +132,7 @@ pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
     );
 }
 
-/// Prints the MTRRs [`vmx::mtrr::read`] decoded: whether they are on, the
+/// Prints the MTRRs [`crate::x86::mtrr::read`] decoded: whether they are on, the
 /// default type, each variable range in use, and the types the fixed ranges
 /// give the first MiB.
 pub(super) fn mtrrs(mtrrs: &Mtrrs) {
@@ -145,7 +144,7 @@ pub(super) fn mtrrs(mtrrs: &Mtrrs) {
         log!("MTRR {range}");
     }
     if enabled.fixed_enabled() {
-        for run in mtrrs.runs(vmx::mtrr::FIXED_END, vmx::page::PAGE_SIZE as u64) {
+        for run in mtrrs.runs(crate::x86::mtrr::FIXED_END, crate::x86::page::PAGE_SIZE as u64) {
             log!("MTRR fixed {:#07x}..{:#07x}: {}", run.start, run.end, run.type_name());
         }
     }
@@ -266,7 +265,7 @@ pub(super) fn hidden(hidden: Hidden) {
 /// Prints how the current page tables, which the guest will share, map the
 /// guest pages. Only called once all permission checks have passed.
 pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
-    let stack_base = guest.stack_top() - vmx::page::PAGE_SIZE as u64;
+    let stack_base = guest.stack_top() - crate::x86::page::PAGE_SIZE as u64;
     for (name, virtual_address, mapping) in [
         ("code", guest.code_base(), mappings.code),
         ("stack", stack_base, mappings.stack),
@@ -288,12 +287,12 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
     // the host's would turn any XD bit in them into a reserved-bit fault.
     // SAFETY: IA32_EFER exists on every x86_64 CPU, and reading it has no
     // side effects.
-    let nxe = unsafe { vmx::msr::rdmsr(vmx::msr::IA32_EFER) } & vmx::msr::EFER_NXE != 0;
-    let cr4 = vmx::cr::read_cr4();
+    let nxe = unsafe { crate::x86::msr::rdmsr(crate::x86::msr::IA32_EFER) } & crate::x86::msr::EFER_NXE != 0;
+    let cr4 = crate::x86::cr::read_cr4();
     log!(
         "Guest code page executable, stack and data pages writable; host EFER.NXE={nxe} CR4.SMEP={} CR4.SMAP={}.",
-        cr4 & vmx::cr::CR4_SMEP != 0,
-        cr4 & vmx::cr::CR4_SMAP != 0,
+        cr4 & crate::x86::cr::CR4_SMEP != 0,
+        cr4 & crate::x86::cr::CR4_SMAP != 0,
     );
 }
 
@@ -309,12 +308,12 @@ pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps, kind: GuestKind, mtrr: MtrrCap
     );
     let (msrs, ports) = intercepted(kind);
     log!("Intercepted MSRs (read and write) for the {kind:?} guest: {msrs:x?}; intercepted ports: {ports:x?}.");
-    let addresses = vmx::mtrr::every_msr_address().count();
+    let addresses = crate::x86::mtrr::every_msr_address().count();
     match mtrr.msrs().count() {
         0 => log!("Intercepted MTRR addresses (read and write): all {addresses}, which get #GP: the CPU has no MTRRs."),
         count => log!(
             "Intercepted MTRR addresses (read and write): all {addresses}. The guest reads and writes a copy of the {count} MSRs the CPU has (IA32_MTRR_DEF_TYPE, {} fixed-range MSRs and {} variable ranges); the other {} get #GP.",
-            if mtrr.fixed() { vmx::mtrr::FIXED_MSRS } else { 0 },
+            if mtrr.fixed() { crate::x86::mtrr::FIXED_MSRS } else { 0 },
             mtrr.variable_count(),
             addresses - count,
         ),

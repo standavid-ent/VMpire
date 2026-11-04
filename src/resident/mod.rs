@@ -3,7 +3,7 @@
 //! whole design.
 //!
 //! - Its pages: everything Aleph0 keeps is allocated as a resident type
-//!   (`vmx::page`), and bring-up checks each allocation's type in the
+//!   (`crate::x86::page`), and bring-up checks each allocation's type in the
 //!   memory map ([`memory_type_at`], [`memory::is_reclaimable`]).
 //! - Its image: the firmware loads Aleph0 as an application, in
 //!   `LOADER_CODE`, and unloads it when `main` returns. `main` therefore
@@ -26,8 +26,8 @@ use uefi::boot::{self, EventType, MemoryType, Tpl};
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::{Event, Status};
 
-use crate::vmx::page::{self, PAGE_SIZE, RESIDENT_CODE};
-use crate::vmx::vmcall;
+use crate::hv::vmcall;
+use crate::x86::page::{self, PAGE_SIZE, RESIDENT_CODE};
 use pe::{Headers, PeError};
 
 /// Why the image could not be copied.

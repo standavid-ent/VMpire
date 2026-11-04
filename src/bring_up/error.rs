@@ -3,19 +3,18 @@
 use uefi::Status;
 use uefi::boot::MemoryType;
 
-use crate::vmx;
-use crate::vmx::apic::LocalApicError;
-use crate::vmx::context_tables::{GdtError, TssError};
-use crate::vmx::ept::EptError;
-use crate::vmx::exit_bitmaps::ExitBitmapsError;
-use crate::vmx::exit_decision::ExitReason;
-use crate::vmx::guest::GuestMemoryError;
-use crate::vmx::guest_state::GuestStateError;
-use crate::vmx::host::HostError;
-use crate::vmx::mtrr::MtrrError;
-use crate::vmx::vmcs::VmcsError;
-use crate::vmx::vmexit::{VcpuStats, VmExitStackError};
-use crate::vmx::vmxon::VmxOnError;
+use crate::hal::intel::ept::EptError;
+use crate::hal::intel::exit_bitmaps::ExitBitmapsError;
+use crate::hal::intel::guest_state::GuestStateError;
+use crate::hal::intel::vmcs::VmcsError;
+use crate::hal::intel::vmxon::VmxOnError;
+use crate::host::HostError;
+use crate::hv::exit_decision::ExitReason;
+use crate::hv::guest::GuestMemoryError;
+use crate::x86::apic::LocalApicError;
+use crate::x86::context_tables::{GdtError, TssError};
+use crate::x86::mtrr::MtrrError;
+use crate::{hal::intel::vmexit::VmExitStackError, hv::vmexit::VcpuStats};
 
 use super::teardown::TeardownError;
 
@@ -73,10 +72,10 @@ pub enum BringUpError {
         address: u64,
         memory_type: Option<MemoryType>,
     },
-    /// `count` resident allocations came after `vmx::page`'s list was full,
+    /// `count` resident allocations came after `crate::x86::page`'s list was full,
     /// so they could not be checked. Before the launch.
     ResidentAllocationsUnlisted(usize),
-    /// `vmx::page` listed no resident allocation, not even the image copy,
+    /// `crate::x86::page` listed no resident allocation, not even the image copy,
     /// so the check would have checked nothing. Before the launch.
     NoResidentAllocations,
     /// The `ExitBootServices` event could not be created. Before the launch.
@@ -176,7 +175,7 @@ pub(super) fn guest_state_error(error: GuestStateError) -> BringUpError {
     let instruction_error = match error {
         // SAFETY: a VmFailValid came from a VMX instruction in VMX operation,
         // and the VMCS is not cleared until teardown, after this runs.
-        GuestStateError::Vmcs { error, .. } => unsafe { vmx::vmcs::instruction_error_for(error) },
+        GuestStateError::Vmcs { error, .. } => unsafe { crate::hal::intel::vmcs::instruction_error_for(error) },
         _ => None,
     };
     BringUpError::GuestState {
@@ -201,7 +200,7 @@ pub(super) fn vmcs_step(operation: &'static str) -> impl FnOnce(VmcsError) -> Br
         // SAFETY: a VmFailValid came from a VMX instruction in VMX
         // operation, and the VMCS is not cleared until teardown, after this
         // runs.
-        instruction_error: unsafe { vmx::vmcs::instruction_error_for(error) },
+        instruction_error: unsafe { crate::hal::intel::vmcs::instruction_error_for(error) },
     }
 }
 
@@ -290,7 +289,7 @@ pub fn report_error(error: BringUpError) {
         BringUpError::UnexpectedExit { number, reason } => log!(
             "Guest stopped at VM exit #{number}: reason={} ({}){}; Aleph0 did not resume the guest.",
             reason.basic,
-            vmx::exit_decision::exit_reason_name(reason.basic),
+            crate::hv::exit_decision::exit_reason_name(reason.basic),
             if reason.entry_failure { " [VM entry failed]" } else { "" },
         ),
         BringUpError::MtrrsChanged => {
@@ -298,11 +297,11 @@ pub fn report_error(error: BringUpError) {
         }
         BringUpError::VmExitStackFull => log!(
             "The exit handler used all {} bytes of the VM-exit stack and may have overwritten the memory below it.",
-            vmx::vmexit::VM_EXIT_STACK_SIZE,
+            crate::hal::intel::vmexit::VM_EXIT_STACK_SIZE,
         ),
         BringUpError::UnexpectedExitStats(stats) => log!(
             "Guest finished, but its exit statistics were {stats}; expected {}.",
-            vmx::guest::expected_stats(&stats),
+            crate::hv::guest::expected_stats(&stats),
         ),
         BringUpError::ResumeFailed {
             error,
@@ -317,7 +316,7 @@ pub fn report_error(error: BringUpError) {
 fn report_vmcs_error(operation: &str, error: VmcsError, instruction_error: Option<u32>) {
     match (error, instruction_error) {
         (VmcsError::VmFailValid, Some(code)) => {
-            let name = vmx::vmcs::vm_instruction_error_name(code);
+            let name = crate::hal::intel::vmcs::vm_instruction_error_name(code);
             log!("VMCS {operation} failed: {name} ({code})");
         }
         (VmcsError::VmFailValid, None) => {

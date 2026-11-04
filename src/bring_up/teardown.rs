@@ -8,10 +8,10 @@
 //! The order matters:
 //!
 //! 1. Load the firmware's CR3, GDTR and IDTR again. A VM exit loads
-//!    Aleph0's own page tables and descriptor tables (`vmx::host`), and the
+//!    Aleph0's own page tables and descriptor tables (`crate::host`), and the
 //!    code after a stop keeps running on them until here. CR3 comes first,
 //!    before anything can call firmware. The segment selectors need no
-//!    reload: the host GDT keeps the firmware's selectors (`vmx::host`'s
+//!    reload: the host GDT keeps the firmware's selectors (`crate::host`'s
 //!    `gdt.rs`).
 //! 2. VMCLEAR the VMCS, so the CPU writes any VMCS data it caches back to
 //!    memory.
@@ -41,12 +41,12 @@
 
 use core::arch::asm;
 
+use crate::hal::intel::instruction::VmxFail;
+use crate::hal::intel::vmcs::{VmcsError, VmcsRegion};
+use crate::hal::intel::vmxon::VmxOperation;
 use crate::output::{self, Phase};
-use crate::vmx::cr::{self, CR4_VMXE};
-use crate::vmx::instruction::VmxFail;
-use crate::vmx::segment::{self, DescriptorTable};
-use crate::vmx::vmcs::{VmcsError, VmcsRegion};
-use crate::vmx::vmxon::VmxOperation;
+use crate::x86::cr::{self, CR4_VMXE};
+use crate::x86::segment::{self, DescriptorTable};
 
 /// RFLAGS.IF, bit 9: maskable interrupts are delivered.
 const RFLAGS_IF: u64 = 1 << 9;
