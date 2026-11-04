@@ -115,7 +115,7 @@ descriptor encoding/decoding) and run on the host. Nothing that executes VMX
 instructions can be unit-tested; that still needs a boot under Hyper-V.
 
 The tests live in `tests/unit/`, which mirrors `src/`: the tests for
-`src/vmx/vmexit/handler.rs` are in `tests/unit/vmx/vmexit/handler.rs`. Each source file
+`src/hv/vmexit/handler.rs` are in `tests/unit/hv/vmexit/handler.rs`. Each source file
 includes its test file with `#[cfg(test)] #[path = "..."] mod tests;`, so the
 tests stay a child module that can reach private items, and none of them is
 compiled into the `.efi`.
@@ -175,27 +175,24 @@ diagnostics that run before VMXON.
 | --- | --- |
 | `src/main.rs` | UEFI entry point and the `log!` macro; copies the image to resident memory and runs on from the copy |
 | `src/resident/` | Staying resident after `ExitBootServices`: the relocated image copy and the `ExitBootServices` event (`mod.rs`), which memory types the OS reclaims (`memory.rs`), PE32+ base relocation (`pe.rs`) |
-| `src/vmx/page.rs` | Page allocation in the resident memory types, with the list of resident allocations bring-up checks |
+| `src/x86/page.rs` | Page allocation in the resident memory types, with the list of resident allocations bring-up checks |
 | `src/bring_up/` | The bring-up sequence (`mod.rs`), its errors (`error.rs`), status lines (`report.rs`) and the return to firmware (`teardown.rs`) |
 | `src/output.rs` | Output phases and the firmware-free panic handler |
 | `crates/uart/src/serial.rs` | Serial logger usable without firmware, on COM2 (`SerialPort`); COM1 is left to the guest |
 | `crates/uart/src/port.rs` | in/out of 1, 2 and 4 bytes, for the serial driver and the exit handler |
-| `src/vmx/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access, with the CR0/CR4 guest/host masks and read shadows that hide VMXE from the guest (see [docs/CONTROL_REGISTERS.md](docs/CONTROL_REGISTERS.md)) |
-| `src/vmx/context_tables.rs`, `segment.rs` | The GDT copy with a TSS that bring-up and the test guest run on, and the TSS layout; gate and descriptor encoding, segmentation state |
-| `src/vmx/host/` | What VMX root operation runs on: Aleph0's page tables (`page_tables.rs`), GDT (`gdt.rs`), IDT with interrupt stacks (`idt.rs`) and the NMI and fault handlers (`handlers.rs`) |
-| `src/vmx/vmxon.rs` | Entering and leaving VMX root operation |
-| `src/vmx/vmcall.rs` | Aleph0's own VMCALLs, told apart by RCX: the end of boot services, and a test call |
-| `src/vmx/hyperv.rs` | Hyper-V's interface, which the guest keeps: detecting it, and forwarding the guest's hypercalls and synthetic MSRs from root operation, with the recovery points for those Hyper-V refuses (see [docs/HYPERV_INTERFACE.md](docs/HYPERV_INTERFACE.md), the decision and its runs) |
-| `src/vmx/region.rs` | The revision-stamped 4 KiB page that both the VMXON region and the VMCS are |
-| `src/vmx/guest.rs`, `paging.rs` | The built-in test guest's code, data, stack and IDT pages; the page-table walk that checks them |
-| `src/vmx/ept/` | EPT: support check, the identity map of the whole guest-physical address space (`MapLayout`: PDs for the memory map, UC 1 GiB pages above) with the guest's data page and NMI stack page read-only, write grant and INVEPT, and the memory types that follow the guest's MTRRs, with spare PTs (`mod.rs`); the walk of a GPA through the tables and what the CPU refuses in an entry, for the stop on any other EPT exit (`walk.rs`) |
-| `src/vmx/apic.rs` | IA32_APIC_BASE (the Local APIC's register page and mode), and the check that the test guest can read the page through EPT |
-| `src/vmx/mtrr/` | The MTRRs: decoding them and the memory type of each address, which the EPT entries copy (`mod.rs`); the MTRR MSRs a CPU has, the values WRMSR refuses, reading them, and the guest's copy (`registers.rs`) |
-| `src/vmx/exit_bitmaps.rs` | The MSR and I/O bitmaps: which MSRs and ports exit, and their pages |
-| `src/vmx/guest_state.rs` | Guest-state VMCS fields, copied from the host CPU, and where each guest starts |
-| `src/vmx/vmcs/mod.rs`, `fields.rs`, `launch.rs` | VMCS lifecycle, field access, controls and host state; every field encoding; the launch stub that returns when the test guest stops, and the in-place launch the firmware goes on from as the guest |
-| `src/vmx/vmexit/` | VM-exit stack and entry stub with the VMRESUME path (`mod.rs`); the exit handler, as read, judge, carry out and report (`handler.rs`); the guest's copy of its MTRRs (`guest_mtrrs.rs`); its report lines (`report.rs`), how much of each exit they print (`policy.rs`), and what every stop adds: the guest's state and registers (`dump.rs`) and the last 64 exits (`history.rs`) |
-| `src/vmx/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) and the routing of the guest's MTRR MSRs to its copy and of Hyper-V's synthetic MSRs to Hyper-V are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection with its NMI and interrupt windows) in `scenario.rs` |
+| `src/x86/cpuid.rs`, `msr.rs`, `cr.rs` | CPU feature, MSR and control-register access, with the CR0/CR4 guest/host masks and read shadows that hide the virtualization enable bit from the guest (see [docs/CONTROL_REGISTERS.md](docs/CONTROL_REGISTERS.md)) |
+| `src/x86/context_tables.rs`, `segment.rs` | The GDT copy with a TSS that bring-up and the test guest run on, and the TSS layout; gate and descriptor encoding, segmentation state |
+| `src/host/` | What root mode runs on: Aleph0's page tables (`page_tables.rs`), GDT (`gdt.rs`), IDT with interrupt stacks (`idt.rs`) and the NMI and fault handlers (`handlers.rs`) |
+| `src/hal/mod.rs`, `types.rs` | The hardware interface: the traits shared code calls (`HardwareVirtualization`, `Vcpu`, `VmExit`, `NestedPaging`, `Intercepts`, `Hypercall`) and their neutral types; the Cargo feature picks the backend (`intel`, the default). See HAL_STRUCTURE.md |
+| `src/hal/intel/` | The VT-x backend: VMXON/VMXOFF (`vmxon.rs`), the VMXON/VMCS page (`region.rs`), the VMX MSRs (`msr.rs`), the VMCS and its launch (`vmcs/`), the guest state (`guest_state.rs`), EPT (`ept/`), the MSR and I/O bitmaps (`exit_bitmaps.rs`), the VM-exit stack, entry stub, exit decoders and stop dump (`vmexit/`), and one type per `hal` trait (`virtualization.rs`, `vcpu.rs`, `vm_exit.rs`, `nested_paging.rs`, `intercepts.rs`, `hypercall.rs`) |
+| `src/hv/vmcall.rs` | Aleph0's own hypercalls, told apart by RCX: the end of boot services, and a test call |
+| `src/hv/hyperv.rs` | Hyper-V's interface, which the guest keeps: detecting it, and forwarding the guest's hypercalls and synthetic MSRs from root operation, with the recovery points for those Hyper-V refuses (see [docs/HYPERV_INTERFACE.md](docs/HYPERV_INTERFACE.md), the decision and its runs) |
+| `src/hv/guest.rs`, `src/x86/paging.rs` | The built-in test guest's code, data, stack and IDT pages; the page-table walk that checks them |
+| `src/x86/apic.rs` | IA32_APIC_BASE (the Local APIC's register page and mode), and the check that the test guest can read the page through EPT |
+| `src/x86/mtrr/` | The MTRRs: decoding them and the memory type of each address, which the EPT entries copy (`mod.rs`); the MTRR MSRs a CPU has, the values WRMSR refuses, reading them, and the guest's copy (`registers.rs`) |
+| `src/hv/intercepted.rs` | Which MSRs and ports exit for each guest, besides the MTRRs |
+| `src/hv/vmexit/` | The exit handler, as read, judge, carry out and report (`handler.rs`); the guest's copy of its MTRRs (`guest_mtrrs.rs`); its report lines (`report.rs`), how much of each exit they print (`policy.rs`), the vCPU's statistics (`stats.rs`), and the last 64 exits every stop adds (`history.rs`) |
+| `src/hv/exit_decision/` | The pure decision for each exit: shared exit types and the dispatch on the exit reason (`mod.rs`), and one handler per reason; the instructions Aleph0 executes for any guest (CPUID, RDMSR/WRMSR, IN/OUT) and the routing of the guest's MTRR MSRs to its copy and of Hyper-V's synthetic MSRs to Hyper-V are in `emulation.rs`, the test guest's own exits (EPT write, VMCALLs, NMI reinjection with its NMI and interrupt windows) in `scenario.rs` |
 | `tests/unit/` | Host unit tests, mirroring `src/` (see [Test](#test)) |
 | `tools/ebs-harness/` | The ExitBootServices test harness, an EFI application of its own (see [docs/RESIDENT.md](docs/RESIDENT.md)) |
 | `scripts/run.ps1` | Build and boot under QEMU + OVMF (no VMX) |

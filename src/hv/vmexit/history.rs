@@ -10,7 +10,8 @@
 use core::cell::UnsafeCell;
 use core::fmt;
 
-use crate::hv::exit_decision::{ExitEvent, ExitReason, exit_reason_name};
+use crate::hal::{VmExit, backend};
+use crate::hv::exit_decision::ExitEvent;
 
 /// Exits the history keeps.
 pub const HISTORY_LEN: usize = 64;
@@ -68,15 +69,9 @@ impl<T: Copy, const N: usize> Ring<T, N> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitRecord {
     pub number: u64,
-    /// VM_EXIT_REASON.
-    pub reason: Option<u32>,
-    pub qualification: Option<u64>,
-    pub rip: Option<u64>,
-    pub length: Option<u64>,
-    /// VM_EXIT_INTERRUPTION_INFO.
-    pub interruption_info: Option<u32>,
-    /// IDT_VECTORING_INFO.
-    pub idt_vectoring_info: Option<u32>,
+    /// What the backend keeps of the exit: its reason and the fields it was
+    /// read from (`hal::VmExit::record`).
+    pub raw: <backend::VmExit as VmExit>::Record,
     /// RAX, RBX, RCX and RDX at the exit.
     pub registers: [u64; 4],
     /// What `decide` made of the exit.
@@ -87,70 +82,23 @@ impl ExitRecord {
     /// Fills the slots of an empty history.
     const EMPTY: Self = Self {
         number: 0,
-        reason: None,
-        qualification: None,
-        rip: None,
-        length: None,
-        interruption_info: None,
-        idt_vectoring_info: None,
+        raw: <backend::VmExit as VmExit>::EMPTY_RECORD,
         registers: [0; 4],
         event: ExitEvent::Unexpected,
     };
 }
 
-/// A field of a record, or `?` when it could not be read.
-struct Field {
-    value: Option<u64>,
-    /// Hexadecimal; decimal otherwise, for a count.
-    hex: bool,
-}
-
-/// `value` in hexadecimal.
-fn hex(value: Option<u64>) -> Field {
-    Field { value, hex: true }
-}
-
-/// `value`, a count, in decimal.
-fn decimal(value: Option<u64>) -> Field {
-    Field { value, hex: false }
-}
-
-impl fmt::Display for Field {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.value {
-            Some(value) if self.hex => write!(f, "{value:#x}"),
-            Some(value) => write!(f, "{value}"),
-            None => f.write_str("?"),
-        }
-    }
-}
-
 impl fmt::Display for ExitRecord {
     /// One line: `#3 reason=32 (WRMSR) rip=0x7eae1028 len=2 qual=0x0
     /// info=0x0 vectoring=0x0 rax=0x0 rbx=0x20800 rcx=0xc0000102
-    /// rdx=0x7a1e -> Emulated(Wrmsr { .. })`, the event in hexadecimal.
+    /// rdx=0x7a1e -> Emulated(Wrmsr { .. })`, the event in hexadecimal. The
+    /// backend writes the part from `reason` to `vectoring`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "#{} ", self.number)?;
-        match self.reason.map(ExitReason::from_raw) {
-            Some(reason) => write!(
-                f,
-                "reason={} ({}){}",
-                reason.basic,
-                exit_reason_name(reason.basic),
-                if reason.entry_failure { " [entry failed]" } else { "" },
-            )?,
-            None => f.write_str("reason=?")?,
-        }
         let [rax, rbx, rcx, rdx] = self.registers;
         write!(
             f,
-            " rip={} len={} qual={} info={} vectoring={} rax={rax:#x} rbx={rbx:#x} rcx={rcx:#x} rdx={rdx:#x} -> {:x?}",
-            hex(self.rip),
-            decimal(self.length),
-            hex(self.qualification),
-            hex(self.interruption_info.map(u64::from)),
-            hex(self.idt_vectoring_info.map(u64::from)),
-            self.event,
+            "#{} {} rax={rax:#x} rbx={rbx:#x} rcx={rcx:#x} rdx={rdx:#x} -> {:x?}",
+            self.number, self.raw, self.event,
         )
     }
 }

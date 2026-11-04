@@ -64,15 +64,11 @@ const FLAT_DATA: u64 = 0x00CF_9300_0000_FFFF;
 fn flat_code_descriptor_decodes() {
     assert_eq!(SegmentDescriptor(FLAT_CODE_64).base(), 0);
     assert_eq!(SegmentDescriptor(FLAT_CODE_64).limit(), 0xFFFF_FFFF);
-    // G=1 L=1 | P=1 DPL=0 S=1 type=0xB
-    assert_eq!(SegmentDescriptor(FLAT_CODE_64).access_rights(), 0xA09B);
 }
 
 #[test]
 fn flat_data_descriptor_decodes() {
     assert_eq!(SegmentDescriptor(FLAT_DATA).limit(), 0xFFFF_FFFF);
-    // G=1 D/B=1 | P=1 DPL=0 S=1 type=0x3
-    assert_eq!(SegmentDescriptor(FLAT_DATA).access_rights(), 0xC093);
 }
 
 #[test]
@@ -81,9 +77,6 @@ fn scattered_base_and_byte_limit_decode() {
     let descriptor = 0x1201_9334_5678_2345;
     assert_eq!(SegmentDescriptor(descriptor).base(), 0x1234_5678);
     assert_eq!(SegmentDescriptor(descriptor).limit(), 0x1_2345);
-    // Limit bits 19:16 sit between the two access-rights halves; they
-    // must not leak into access-rights bits 11:8.
-    assert_eq!(SegmentDescriptor(descriptor).access_rights(), 0x0093);
 }
 
 #[test]

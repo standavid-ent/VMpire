@@ -43,4 +43,5 @@ pub use stats::{VcpuStats, snapshot as vcpu_stats};
 #[cfg(not(test))]
 pub use history::report as report_exit_history;
 
-use crate::hal::intel::vmexit::{RegisterFrame, dump, read_field};
+pub use handler::{handle_exit, stop_after_failed_resume};
+pub use report::after_stop;

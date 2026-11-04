@@ -283,10 +283,6 @@ pub unsafe fn segment_base_from_gdt(gdt: &DescriptorTable, selector: u16) -> u64
 // │reserved │unusable│G │D │L │AVL│ res │P │DPL│S │ type │
 // └─────────┴────────┴──┴──┴──┴───┴─────┴──┴───┴──┴──────┘
 
-/// VMCS access-rights bit 16: the segment register is unusable, as after
-/// loading a null selector. VM entry then ignores the other bits.
-pub const ACCESS_RIGHTS_UNUSABLE: u32 = 1 << 16;
-
 /// Descriptor bit 55 (G): the limit counts 4 KiB units, not bytes.
 const DESCRIPTOR_GRANULARITY: u64 = 1 << 55;
 
@@ -316,13 +312,6 @@ impl SegmentDescriptor {
         } else {
             raw
         }
-    }
-
-    /// The access rights in VMCS format: descriptor bits 47:40 become bits
-    /// 7:0, descriptor bits 55:52 become bits 15:12, and the limit bits in
-    /// between (11:8 here) are cleared, since VM entry requires them to be 0.
-    pub fn access_rights(self) -> u32 {
-        (self.0 >> 40) as u32 & 0xF0FF
     }
 }
 

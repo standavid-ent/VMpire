@@ -78,8 +78,8 @@ use uefi::boot;
 use uefi::mem::memory_map::MemoryMap;
 
 use crate::hal::intel::instruction::{VmxFail, vmx_asm};
+use crate::hal::intel::msr::ControlCapability;
 use crate::hal::intel::vmcs::fields::SECONDARY_ENABLE_EPT;
-use crate::x86::msr::ControlCapability;
 use crate::x86::mtrr::{MemoryType, MtrrCapabilities, Mtrrs};
 use crate::x86::page::{Allocation, PAGE_SIZE, allocate_zeroed_pages};
 
@@ -114,12 +114,7 @@ const ENTRIES: usize = 512;
 /// How many pages [`Ept::build`] can map read-only and publish for the exit
 /// handler at once: the guest's data page and its NMI-delivery stack page.
 pub const MAX_PROTECTED: usize = 2;
-/// What a PD entry maps: a 2 MiB page, or a PT of 512 4 KiB pages.
-pub const SIZE_2M: u64 = 1 << 21;
-/// What a PDPT entry maps: a PD of 512 2 MiB regions, or a 1 GiB page.
-pub const SIZE_1G: u64 = 1 << 30;
-/// What one PDPT maps: 512 entries of 1 GiB.
-pub const PDPT_SPAN: u64 = ENTRIES as u64 * SIZE_1G;
+pub use crate::x86::paging::{SIZE_1G, SIZE_2M};
 /// Address bits a 4-level EPT walk translates: 9 per level and 12 of page
 /// offset. A GPA needs no more, whatever MAXPHYADDR says.
 const WALK_ADDRESS_BITS: u8 = 48;
@@ -270,81 +265,7 @@ pub fn check_support(
     })
 }
 
-/// The four table levels, as types: EPT's, and those of Aleph0's host page
-/// tables (`crate::host`), which have the same shape. [`EptEntry`] takes one
-/// as its parameter, so each constructor exists only for the level it is
-/// valid at: a PML4 entry cannot map a page, and a PT entry cannot point to
-/// a table.
-pub mod level {
-    mod sealed {
-        pub trait Sealed {}
-    }
-
-    /// One EPT table level. Sealed: the four below are all there are.
-    pub trait Level: sealed::Sealed {
-        /// The level's name, for debug output.
-        const NAME: &'static str;
-        /// Position of the 9 address bits that index this level's table.
-        const SHIFT: u32;
-
-        /// Index into this level's table for `address`.
-        fn index(address: u64) -> usize {
-            ((address >> Self::SHIFT) & 0x1FF) as usize
-        }
-    }
-
-    /// A level whose entries may point to a table of the level below.
-    pub trait TableLevel: Level {
-        /// The level of the table such an entry points to.
-        type Next: Level;
-    }
-
-    /// Page Map Level 4: the root, one entry per 512 GiB. Index bits 47:39.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Pml4 {}
-    /// Page Directory Pointer Table: one entry per GiB. Index bits 38:30.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Pdpt {}
-    /// Page Directory: one entry per 2 MiB, a PD table or a 2 MiB page.
-    /// Index bits 29:21.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Pd {}
-    /// Page Table: one entry per 4 KiB page. Index bits 20:12.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Pt {}
-
-    impl sealed::Sealed for Pml4 {}
-    impl sealed::Sealed for Pdpt {}
-    impl sealed::Sealed for Pd {}
-    impl sealed::Sealed for Pt {}
-
-    impl Level for Pml4 {
-        const NAME: &'static str = "PML4";
-        const SHIFT: u32 = 39;
-    }
-    impl Level for Pdpt {
-        const NAME: &'static str = "PDPT";
-        const SHIFT: u32 = 30;
-    }
-    impl Level for Pd {
-        const NAME: &'static str = "PD";
-        const SHIFT: u32 = 21;
-    }
-    impl Level for Pt {
-        const NAME: &'static str = "PT";
-        const SHIFT: u32 = 12;
-    }
-
-    impl TableLevel for Pml4 {
-        type Next = Pdpt;
-    }
-    impl TableLevel for Pdpt {
-        type Next = Pd;
-    }
-    impl TableLevel for Pd {
-        type Next = Pt;
-    }
-}
+pub use crate::x86::paging::level;
 
 /// One entry of a level-`L` table, laid out as in the module docs.
 /// `repr(transparent)`, so a table page is 512 of these back to back.
@@ -1418,6 +1339,11 @@ impl TypeTables {
             }
         }
         Ok(hidden)
+    }
+
+    /// The EPTP of the tables [`Ept::build`] made.
+    pub fn eptp(&self) -> Eptp {
+        self.eptp
     }
 
     /// The INVEPT type [`apply`](Self::apply) uses.

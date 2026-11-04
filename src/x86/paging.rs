@@ -314,6 +314,89 @@ pub unsafe fn walk_current(virtual_address: u64) -> Result<Mapping, WalkError> {
 /// The tests build small fake page tables in a `HashMap` (physical address
 /// to entry) and check translation, permission combining, large pages, and
 /// missing entries.
+/// What a PD entry maps: a 2 MiB page, or a PT of 512 4 KiB pages.
+pub const SIZE_2M: u64 = 1 << 21;
+/// What a PDPT entry maps: a PD of 512 2 MiB regions, or a 1 GiB page.
+pub const SIZE_1G: u64 = 1 << 30;
+/// What one PDPT maps: 512 entries of 1 GiB.
+pub const PDPT_SPAN: u64 = 512 * SIZE_1G;
+
+/// The four table levels, as types: EPT's, and those of Aleph0's host page
+/// tables (`crate::host`), which have the same shape. `EptEntry` takes one
+/// as its parameter, so each constructor exists only for the level it is
+/// valid at: a PML4 entry cannot map a page, and a PT entry cannot point to
+/// a table.
+pub mod level {
+    mod sealed {
+        pub trait Sealed {}
+    }
+
+    /// One EPT table level. Sealed: the four below are all there are.
+    pub trait Level: sealed::Sealed {
+        /// The level's name, for debug output.
+        const NAME: &'static str;
+        /// Position of the 9 address bits that index this level's table.
+        const SHIFT: u32;
+
+        /// Index into this level's table for `address`.
+        fn index(address: u64) -> usize {
+            ((address >> Self::SHIFT) & 0x1FF) as usize
+        }
+    }
+
+    /// A level whose entries may point to a table of the level below.
+    pub trait TableLevel: Level {
+        /// The level of the table such an entry points to.
+        type Next: Level;
+    }
+
+    /// Page Map Level 4: the root, one entry per 512 GiB. Index bits 47:39.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Pml4 {}
+    /// Page Directory Pointer Table: one entry per GiB. Index bits 38:30.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Pdpt {}
+    /// Page Directory: one entry per 2 MiB, a PD table or a 2 MiB page.
+    /// Index bits 29:21.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Pd {}
+    /// Page Table: one entry per 4 KiB page. Index bits 20:12.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Pt {}
+
+    impl sealed::Sealed for Pml4 {}
+    impl sealed::Sealed for Pdpt {}
+    impl sealed::Sealed for Pd {}
+    impl sealed::Sealed for Pt {}
+
+    impl Level for Pml4 {
+        const NAME: &'static str = "PML4";
+        const SHIFT: u32 = 39;
+    }
+    impl Level for Pdpt {
+        const NAME: &'static str = "PDPT";
+        const SHIFT: u32 = 30;
+    }
+    impl Level for Pd {
+        const NAME: &'static str = "PD";
+        const SHIFT: u32 = 21;
+    }
+    impl Level for Pt {
+        const NAME: &'static str = "PT";
+        const SHIFT: u32 = 12;
+    }
+
+    impl TableLevel for Pml4 {
+        type Next = Pdpt;
+    }
+    impl TableLevel for Pdpt {
+        type Next = Pd;
+    }
+    impl TableLevel for Pd {
+        type Next = Pt;
+    }
+}
+
 #[cfg(test)]
 #[path = "../../tests/unit/x86/paging.rs"]
 mod tests;

@@ -5,6 +5,7 @@
 //! private items.
 
 use super::*;
+use crate::hal::intel::vm_exit::Record;
 use crate::hv::exit_decision::Emulation;
 
 fn kept<const N: usize>(ring: &Ring<u32, N>) -> Vec<u32> {
@@ -54,12 +55,14 @@ fn a_record_prints_as_one_line() {
     // Exit #3 of the Hyper-V runs: WRMSR of IA32_KERNEL_GS_BASE.
     let record = ExitRecord {
         number: 3,
-        reason: Some(32),
-        qualification: Some(0),
-        rip: Some(0x7eae_1028),
-        length: Some(2),
-        interruption_info: Some(0),
-        idt_vectoring_info: Some(0),
+        raw: Record {
+            reason: Some(32),
+            qualification: Some(0),
+            rip: Some(0x7eae_1028),
+            length: Some(2),
+            interruption_info: Some(0),
+            idt_vectoring_info: Some(0),
+        },
         registers: [0, 0x2_0800, 0xc000_0102, 0x7a1e],
         event: ExitEvent::Emulated(Emulation::Wrmsr {
             msr: 0xc000_0102,
@@ -77,8 +80,11 @@ fn a_record_prints_as_one_line() {
 fn a_record_marks_unreadable_fields_and_failed_entries() {
     let record = ExitRecord {
         number: 1,
-        reason: Some(33 | 1 << 31),
-        rip: None,
+        raw: Record {
+            reason: Some(33 | 1 << 31),
+            rip: None,
+            ..<backend::VmExit as VmExit>::EMPTY_RECORD
+        },
         ..ExitRecord::EMPTY
     };
     assert_eq!(

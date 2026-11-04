@@ -13,12 +13,6 @@ pub const ADDRESS_SIZES: u32 = 0x8000_0008;
 /// Size").
 const DEFAULT_PHYSICAL_ADDRESS_BITS: u8 = 36;
 
-/// Checks CPUID.1:ECX.VMX\[bit 5\] to determine whether the CPU implements
-/// VMX (Intel VT-x).
-pub fn is_vmx_supported() -> bool {
-    __cpuid(1).ecx >> 5 & 1 == 1
-}
-
 /// Checks CPUID.1:EDX.MTRR\[bit 12\]: whether the CPU has memory type range
 /// registers. IA32_MTRRCAP and the other MTRR MSRs exist only if it does.
 pub fn has_mtrr() -> bool {

@@ -41,11 +41,10 @@
 
 use core::arch::asm;
 
-use crate::hal::intel::instruction::VmxFail;
-use crate::hal::intel::vmcs::{VmcsError, VmcsRegion};
-use crate::hal::intel::vmxon::VmxOperation;
+use super::error::{VcpuError, VirtualizationError};
+use crate::hal::{HardwareVirtualization, Vcpu as _, backend};
 use crate::output::{self, Phase};
-use crate::x86::cr::{self, CR4_VMXE};
+use crate::x86::cr;
 use crate::x86::segment::{self, DescriptorTable};
 
 /// RFLAGS.IF, bit 9: maskable interrupts are delivered.
@@ -64,10 +63,12 @@ pub(super) struct FirmwareState {
 /// Which teardown step failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeardownError {
-    /// VMCLEAR failed, so the VMCS data may not have been written back.
-    Vmclear(VmcsError),
-    /// VMXOFF failed: the CPU is still in VMX operation, with CR4.VMXE set.
-    Vmxoff(VmxFail),
+    /// Releasing the vCPU failed, so its state may not have been written
+    /// back.
+    Release(VcpuError),
+    /// Leaving root mode failed: the CPU is still in it, with the enable bit
+    /// set.
+    Disable(VirtualizationError),
 }
 
 /// Whether maskable interrupts are on right now.
@@ -92,12 +93,12 @@ fn read_rflags() -> u64 {
 ///
 /// # Safety
 ///
-/// `vmx_operation` must be this CPU's VMX operation and `vmcs` its only
-/// VMCS, if one was created. The guest must not be running, and `firmware`
+/// `virtualization` must be this CPU's root mode and `vcpu` its only vCPU,
+/// if one was created. The guest must not be running, and `firmware`
 /// must describe the firmware's live descriptor tables.
 pub(super) unsafe fn teardown(
-    vmx_operation: VmxOperation,
-    vmcs: Option<&VmcsRegion>,
+    virtualization: backend::HardwareVirtualization,
+    vcpu: Option<&backend::Vcpu>,
     firmware: &FirmwareState,
 ) -> Result<(), TeardownError> {
     let mut result = Ok(());
@@ -112,21 +113,19 @@ pub(super) unsafe fn teardown(
         segment::load_idtr(&firmware.idtr);
     }
 
-    if let Some(vmcs) = vmcs
-        // SAFETY: still in VMX operation, with `vmcs` this CPU's VMCS;
-        // VMXOFF comes next.
-        && let Err(error) = unsafe { vmcs.vmclear() }
+    if let Some(vcpu) = vcpu
+        // SAFETY: still in root mode, with `vcpu` this CPU's vCPU; leaving
+        // root mode comes next. Prints its own failure.
+        && let Err(error) = unsafe { vcpu.release() }
     {
-        log!("Teardown: VMCLEAR failed: {error:?}.");
-        result = Err(TeardownError::Vmclear(error));
+        result = Err(TeardownError::Release(error));
     }
 
-    // SAFETY: the VMCS was cleared above (or its failure printed, which only
-    // leaves that VMCS's memory stale), and no VMX instruction runs after
-    // this.
-    if let Err(fail) = unsafe { vmx_operation.leave() } {
-        log!("Teardown: VMXOFF failed: {fail:?}; still in VMX operation, CR4.VMXE left set.");
-        result = result.and(Err(TeardownError::Vmxoff(fail)));
+    // SAFETY: the vCPU was released above (or its failure printed, which
+    // only leaves that vCPU's memory stale), and no vCPU instruction runs
+    // after this. Prints its own failure.
+    if let Err(error) = unsafe { virtualization.disable() } {
+        result = result.and(Err(TeardownError::Disable(error)));
     }
 
     output::set_phase(Phase::BootServices);
@@ -143,12 +142,13 @@ pub(super) unsafe fn teardown(
 /// Prints whether teardown left the CPU as firmware expects. Reaches the
 /// console too: the phase is boot services again.
 fn report(firmware: &FirmwareState) {
-    let vmxe = cr::read_cr4() & CR4_VMXE != 0;
+    let enabled = backend::HardwareVirtualization::enabled();
     let cr3_restored = cr::read_cr3() == firmware.cr3;
     let tables_restored = segment::read_gdtr() == firmware.gdtr && segment::read_idtr() == firmware.idtr;
     log!(
-        "Teardown: CR4.VMXE={} firmware CR3 restored={cr3_restored} firmware GDTR/IDTR restored={tables_restored} IF={}.",
-        u8::from(vmxe),
+        "Teardown: {}={} firmware CR3 restored={cr3_restored} firmware GDTR/IDTR restored={tables_restored} IF={}.",
+        <backend::HardwareVirtualization as HardwareVirtualization>::ENABLE_BIT,
+        u8::from(enabled),
         u8::from(interrupts_enabled()),
     );
 }

@@ -36,6 +36,8 @@ use core::arch::x86_64::{__cpuid, CpuidResult};
 use core::ops::RangeInclusive;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::hal::{Hypercall as _, backend};
+
 /// CPUID.1:ECX bit 31: a hypervisor is present, and leaves 0x40000000 and up
 /// describe it.
 const HYPERVISOR_PRESENT: u32 = 1 << 31;
@@ -181,34 +183,10 @@ pub fn call_code(input: u64) -> u16 {
     input as u16
 }
 
-/// The registers a hypercall reads and writes (TLFS, "Hypercall Inputs" for
-/// x64): RCX the input value, RDX and R8 the input and output GPAs (or, for
-/// a fast hypercall, its input data, and RDX:R8 its output), RAX the result
-/// value. Hyper-V may also update RCX, the rep start index, when it
-/// continues a rep hypercall.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HypercallRegisters {
-    pub rcx: u64,
-    pub rdx: u64,
-    pub r8: u64,
-    pub rax: u64,
-}
-
-// `hyperv_forward_hypercall` reads and writes the fields at these offsets.
-const _: () = {
-    assert!(core::mem::offset_of!(HypercallRegisters, rcx) == 0);
-    assert!(core::mem::offset_of!(HypercallRegisters, rdx) == 8);
-    assert!(core::mem::offset_of!(HypercallRegisters, r8) == 16);
-    assert!(core::mem::offset_of!(HypercallRegisters, rax) == 24);
-};
-
-/// Hyper-V refused a forwarded instruction with the exception its
-/// forwarder recovers from: #UD for VMCALL, #GP for RDMSR and WRMSR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Refused;
+pub use crate::hal::types::{HypercallRegisters, Refused};
 
 /// IDT vectors the forwarders recover from.
+#[cfg(test)]
 const INVALID_OPCODE: u8 = 6;
 const GENERAL_PROTECTION: u8 = 13;
 
@@ -218,38 +196,15 @@ const GENERAL_PROTECTION: u8 = 13;
 // label, with RSP and RFLAGS as at the instruction and every register the
 // ABI lets a callee change possibly changed.
 //
-// hyperv_forward_hypercall(registers = RCX): loads RCX, RDX and R8 from
-// `registers`, keeping the pointer on the stack, since Hyper-V may write
-// RCX (and RDX, R8 for a fast hypercall's output), and stores all four back.
+// The hypercall's forwarder runs the backend's hypercall instruction, so it
+// is the backend's (`hal::Hypercall::forward`); its recovery point comes
+// from there too.
 //
 // hyperv_forward_rdmsr(msr = ECX, value = RDX): stores EDX:EAX at `value`.
 //
 // hyperv_forward_wrmsr(msr = ECX, value = RDX): writes RDX as EDX:EAX.
 core::arch::global_asm!(
     r#"
-    .globl hyperv_forward_hypercall
-    .globl hyperv_hypercall_instruction
-    .globl hyperv_hypercall_refused
-hyperv_forward_hypercall:
-    push rcx
-    mov rax, rcx
-    mov rcx, [rax]
-    mov rdx, [rax + 8]
-    mov r8, [rax + 16]
-hyperv_hypercall_instruction:
-    vmcall
-    pop r9
-    mov [r9], rcx
-    mov [r9 + 8], rdx
-    mov [r9 + 16], r8
-    mov [r9 + 24], rax
-    xor eax, eax
-    ret
-hyperv_hypercall_refused:
-    pop r9
-    mov eax, 1
-    ret
-
     .globl hyperv_forward_rdmsr
     .globl hyperv_rdmsr_instruction
     .globl hyperv_rdmsr_refused
@@ -283,14 +238,11 @@ hyperv_wrmsr_refused:
 );
 
 unsafe extern "efiapi" {
-    fn hyperv_forward_hypercall(registers: *mut HypercallRegisters) -> u64;
     fn hyperv_forward_rdmsr(msr: u32, value: *mut u64) -> u64;
     fn hyperv_forward_wrmsr(msr: u32, value: u64) -> u64;
 }
 
 unsafe extern "C" {
-    static hyperv_hypercall_instruction: u8;
-    static hyperv_hypercall_refused: u8;
     static hyperv_rdmsr_instruction: u8;
     static hyperv_rdmsr_refused: u8;
     static hyperv_wrmsr_instruction: u8;
@@ -302,12 +254,9 @@ unsafe extern "C" {
 /// and `vector` the exception Hyper-V refuses it with. `None` for any other
 /// fault, which stays a bug in Aleph0.
 pub fn recovery(rip: u64, vector: u8) -> Option<u64> {
+    let hypercall = backend::Hypercall::recovery_point();
     let points = [
-        (
-            &raw const hyperv_hypercall_instruction,
-            INVALID_OPCODE,
-            &raw const hyperv_hypercall_refused,
-        ),
+        (hypercall.instruction, hypercall.vector, hypercall.resume),
         (
             &raw const hyperv_rdmsr_instruction,
             GENERAL_PROTECTION,
@@ -330,17 +279,13 @@ pub fn recovery(rip: u64, vector: u8) -> Option<u64> {
 ///
 /// # Safety
 ///
-/// VMX root operation under Hyper-V, at CPL 0, with the guest stopped at its
-/// VMCALL exit and the host IDT loaded, whose #UD gate recovers through
+/// Exit context under Hyper-V, at CPL 0, with the guest stopped at its
+/// hypercall exit and the host IDT loaded, whose #UD gate recovers through
 /// [`recovery`]. The hypercall acts on Aleph0's virtual processor and on the
 /// guest pages the GPAs name, as the guest asked.
 pub unsafe fn forward_hypercall(registers: &mut HypercallRegisters) -> Result<(), Refused> {
-    // SAFETY: the caller's guarantees; the forwarder reads and writes only
-    // `registers` and its own stack.
-    match unsafe { hyperv_forward_hypercall(registers) } {
-        0 => Ok(()),
-        _ => Err(Refused),
-    }
+    // SAFETY: the caller's guarantees.
+    unsafe { backend::Hypercall::forward(registers) }
 }
 
 /// RDMSR of the synthetic MSR `msr`, in root operation.

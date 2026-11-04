@@ -64,7 +64,7 @@ alone.
 Code that executes VMX instructions or touches hardware cannot be unit-tested.
 Keep it thin, and put the logic in pure functions that can be:
 
-- The exit handler reads, judges and applies (`src/vmx/vmexit/handler.rs`).
+- The exit handler reads, judges and applies (`src/hv/vmexit/handler.rs`).
   The judgement, `exit_decision::decide`, is a pure function of the exit
   fields and the handler's state, and is host-tested.
 - Decoding and encoding of raw values (RFLAGS, descriptors, control MSRs, EPT
@@ -108,12 +108,12 @@ working after `ExitBootServices`. In code reachable from it:
 ## Tests
 
 Unit tests live in `tests/unit/`, which mirrors `src/`: the tests for
-`src/vmx/paging.rs` are in `tests/unit/vmx/paging.rs`. Each source file includes its
+`src/x86/paging.rs` are in `tests/unit/x86/paging.rs`. Each source file includes its
 tests with
 
 ```rust
 #[cfg(test)]
-#[path = "../../tests/unit/vmx/ept.rs"]
+#[path = "../../tests/unit/x86/paging.rs"]
 mod tests;
 ```
 

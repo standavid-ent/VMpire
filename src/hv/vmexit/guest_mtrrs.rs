@@ -18,11 +18,17 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::hal::intel::ept::{InveptType, Retyped, TypeTables};
-use crate::hal::intel::instruction::VmxFail;
+use crate::hal::types::{Flush, Retyped};
+use crate::hal::{NestedPaging, backend};
 use crate::x86::mtrr::{MtrrCapabilities, MtrrError, MtrrMsr, MtrrRegisters, MtrrState, Mtrrs};
 
-/// The guest's MTRRs, and the EPT tables whose memory types follow them.
+/// The backend's nested page tables the exit handler changes.
+pub(super) type TypeTables = <backend::NestedPaging as NestedPaging>::Tables;
+/// The backend's error for a flush that failed.
+type FlushError = <backend::NestedPaging as NestedPaging>::FlushError;
+
+/// The guest's MTRRs, and the nested page tables whose memory types follow
+/// them.
 struct GuestMtrrs {
     state: MtrrState,
     types: TypeTables,
@@ -105,8 +111,8 @@ pub(super) struct MtrrWrite {
     /// What changed in EPT, or `None` when every address keeps the type it
     /// had, so EPT was left alone.
     pub(super) retyped: Option<Retyped>,
-    /// The INVEPT run once EPT changed.
-    pub(super) invept: Option<InveptType>,
+    /// The flush run once the tables changed.
+    pub(super) invept: Option<Flush>,
 }
 
 /// Why an access to the guest's MTRRs failed. None of these should happen:
@@ -120,8 +126,8 @@ pub(super) enum MtrrAccessFailure {
     InUse,
     /// The copy refused the value.
     Refused(MtrrError),
-    /// INVEPT failed after EPT took the new types.
-    Invept(VmxFail),
+    /// The flush failed after the tables took the new types.
+    Invept(FlushError),
 }
 
 impl From<Unavailable> for MtrrAccessFailure {
@@ -139,7 +145,12 @@ impl fmt::Display for MtrrAccessFailure {
             Self::NotPublished => f.write_str("the guest's MTRRs were never set up"),
             Self::InUse => f.write_str("the guest's MTRRs were reached again while already in use"),
             Self::Refused(error) => write!(f, "the guest's MTRRs refused the write ({error})"),
-            Self::Invept(error) => write!(f, "EPT took the guest's MTRR types, but INVEPT failed ({error:?})"),
+            Self::Invept(error) => write!(
+                f,
+                "{} took the guest's MTRR types, but {} failed ({error:?})",
+                <backend::NestedPaging as NestedPaging>::NAME,
+                <backend::NestedPaging as NestedPaging>::FLUSH,
+            ),
         }
     }
 }
@@ -161,11 +172,14 @@ pub(super) unsafe fn write(msr: MtrrMsr, value: u64) -> Result<MtrrWrite, MtrrAc
             });
         }
         // SAFETY: the caller guarantees exit context, and `types` came from
-        // `Ept::build`, whose tables are never freed.
-        let retyped = unsafe { guest.types.apply(guest.state.mtrrs()) }.map_err(MtrrAccessFailure::Invept)?;
+        // `NestedPaging::build`, whose tables are never freed.
+        let retyped = unsafe { backend::NestedPaging::apply_memory_types(&mut guest.types, guest.state.mtrrs()) }
+            .map_err(MtrrAccessFailure::Invept)?;
         Ok(MtrrWrite {
             retyped: Some(retyped),
-            invept: retyped.changed().then(|| guest.types.invept()),
+            invept: retyped
+                .changed()
+                .then(|| backend::NestedPaging::flush_type(&guest.types)),
         })
     })
     .unwrap_or_else(|unavailable| Err(unavailable.into()))

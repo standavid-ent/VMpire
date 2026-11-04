@@ -15,9 +15,9 @@
 //! never reclaim it.
 
 use crate::hal::intel::instruction::{VmxFail, vmx_asm};
+use crate::hal::intel::msr;
 use crate::hal::intel::region::VmxRegion;
 use crate::x86::cr;
-use crate::x86::msr;
 use crate::x86::page::PAGE_SIZE;
 
 /// Why entering VMX operation failed.

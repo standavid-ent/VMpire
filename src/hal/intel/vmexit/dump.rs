@@ -17,6 +17,7 @@ use core::fmt;
 
 use super::{RegisterFrame, read_field};
 use crate::hal::intel::guest_state::GuestState;
+use crate::hal::intel::msr::{self, IA32_EFER, IA32_PAT};
 use crate::hal::intel::vmcs::VmcsError;
 use crate::hal::intel::vmcs::fields::{
     EXCEPTION_BITMAP, GUEST_ACTIVITY_STATE, GUEST_DR7, GUEST_IA32_EFER, GUEST_IA32_PAT, GUEST_INTERRUPTIBILITY_STATE,
@@ -27,7 +28,6 @@ use crate::hal::intel::vmcs::fields::{
     VM_EXIT_LOAD_IA32_EFER, VM_EXIT_LOAD_IA32_PAT, VM_EXIT_SAVE_DEBUG_CONTROLS, VM_EXIT_SAVE_IA32_EFER,
     VM_EXIT_SAVE_IA32_PAT,
 };
-use crate::x86::msr::{self, IA32_EFER, IA32_PAT};
 
 /// One line of the dump: a label and the VMCS fields it shows, by name.
 #[derive(Debug, Clone, Copy)]

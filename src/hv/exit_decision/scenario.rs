@@ -32,28 +32,11 @@
 //! Whether every emulated exit came is not decided here: bring-up checks the
 //! exit statistics once the guest has finished (`guest::expected_stats`).
 
-use super::{EptQualification, ExitEvent, ExitInfo, ExitState};
+use super::{ExitEvent, ExitInfo, ExitState, Interruptibility};
 use crate::hv::guest::{GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_MARKER, GUEST_NMI_MARKER};
 
 /// How many main VMCALLs the guest makes; the last one ends the run.
 pub const PLANNED_MAIN_VMCALLS: u32 = 2;
-
-/// Guest interruptibility bit 0: blocking by STI. The Intel SDM (Vol. 3C,
-/// checks on guest non-register state) says: "A processor may require bit 0
-/// (blocking by STI) to be 0 if the valid bit is 1 and the interruption type
-/// is NMI." So an NMI is injected only when this bit is clear too.
-pub(super) const BLOCKING_BY_STI: u32 = 1 << 0;
-/// Guest interruptibility bit 1: blocking by MOV SS. VM entry refuses to
-/// inject an NMI while it is set.
-pub(super) const BLOCKING_BY_MOV_SS: u32 = 1 << 1;
-/// Guest interruptibility bit 3: blocking by NMI. With virtual NMIs this is
-/// an injected NMI the guest has not ended with IRET yet; VM entry refuses
-/// to inject another while it is set.
-pub(super) const BLOCKING_BY_NMI: u32 = 1 << 3;
-/// Any of the blocking bits that may stop an NMI injection. The handler
-/// injects only when none is set, and otherwise waits for the NMI window
-/// instead of injecting blindly.
-const NMI_INJECTION_BLOCKED: u32 = BLOCKING_BY_STI | BLOCKING_BY_MOV_SS | BLOCKING_BY_NMI;
 
 /// Whether, at main VMCALL #1, ECX holds the seed the guest read from its
 /// data page and EDX the value it wrote and read back. Compared as 32-bit
@@ -73,15 +56,21 @@ pub fn expected_main_rax(state: ExitState) -> u64 {
 }
 
 /// The deferral of an NMI the guest cannot take yet (`interruptibility`
-/// has a bit of [`NMI_INJECTION_BLOCKED`]), and `state` with it pending.
+/// blocks NMI injection), and `state` with it pending.
+///
+/// The Intel SDM (Vol. 3C, checks on guest non-register state) says: "A
+/// processor may require bit 0 (blocking by STI) to be 0 if the valid bit is
+/// 1 and the interruption type is NMI." So an NMI is injected only when the
+/// STI shadow is over too, and VM entry refuses one in a MOV SS shadow or
+/// while NMIs are blocked.
 ///
 /// Blocking by STI alone waits for the interrupt window; any other blocking
 /// for the NMI window. A CPU may report an NMI-window exit inside an STI
 /// shadow, where no injection is allowed either, so waiting for the NMI window
 /// there could exit at the same instruction forever (`ResumePlan::
 /// WAIT_FOR_STI_SHADOW`).
-fn deferred(state: ExitState, interruptibility: u32) -> (ExitEvent, ExitState) {
-    let event = if interruptibility & NMI_INJECTION_BLOCKED == BLOCKING_BY_STI {
+fn deferred(state: ExitState, interruptibility: Interruptibility) -> (ExitEvent, ExitState) {
+    let event = if interruptibility.only_sti_shadow() {
         ExitEvent::NmiDeferredPastSti
     } else {
         ExitEvent::NmiDeferred
@@ -105,20 +94,20 @@ fn injected(state: ExitState) -> ExitState {
     }
 }
 
-/// Exception or NMI (exit reason 0). Only an NMI is handled: reinjected now,
+/// Exception or NMI (`ExitReason::ExceptionOrNmi`). Only an NMI is handled: reinjected now,
 /// or once the guest's NMI window opens. Any exception stops the guest.
 pub(super) fn exception_or_nmi(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
-    if !exit.interruption_info.is_nmi() {
+    if !exit.event.is_some_and(|event| event.is_nmi()) {
         return (ExitEvent::Unexpected, state);
     }
-    if exit.interruptibility & NMI_INJECTION_BLOCKED == 0 {
+    if !exit.interruptibility.blocks_nmi_injection() {
         (ExitEvent::NmiInjected, injected(state))
     } else {
         deferred(state, exit.interruptibility)
     }
 }
 
-/// NMI window (exit reason 8): inject the pending NMI.
+/// NMI window (`ExitReason::NmiWindow`): inject the pending NMI.
 pub(super) fn nmi_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
     if !state.nmi_pending {
         return (ExitEvent::Unexpected, state);
@@ -128,14 +117,14 @@ pub(super) fn nmi_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitS
     // would fail the VM entry, so wait: for the interrupt window when STI is
     // the only blocker, which ends the loop such a CPU would otherwise run.
     // (MOV SS stays in the mask; it is harmless.)
-    if exit.interruptibility & NMI_INJECTION_BLOCKED != 0 {
+    if exit.interruptibility.blocks_nmi_injection() {
         deferred(state, exit.interruptibility)
     } else {
         (ExitEvent::NmiWindowInjected, injected(state))
     }
 }
 
-/// Interrupt window (exit reason 7): the STI shadow that held back the
+/// Interrupt window (`ExitReason::InterruptWindow`): the STI shadow that held back the
 /// pending NMI has ended, so inject it. Aleph0 turns interrupt-window exiting
 /// on only for that (`ResumePlan::WAIT_FOR_STI_SHADOW`), so without a pending
 /// NMI the exit is unexpected. The window opens with no STI or MOV SS
@@ -145,14 +134,14 @@ pub(super) fn interrupt_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent,
     if !state.nmi_pending {
         return (ExitEvent::Unexpected, state);
     }
-    if exit.interruptibility & NMI_INJECTION_BLOCKED != 0 {
+    if exit.interruptibility.blocks_nmi_injection() {
         deferred(state, exit.interruptibility)
     } else {
         (ExitEvent::InterruptWindowInjected, injected(state))
     }
 }
 
-/// EPT violation (exit reason 48). Two are handled, each once: the guest's
+/// Nested page fault (`ExitReason::NestedPageFault`). Two are handled, each once: the guest's
 /// write to its protected data page (before the first main VMCALL), and the
 /// reinjected NMI's delivery faulting on the read-only stack page as the CPU
 /// pushes the interrupt frame. The reinjected NMI's delivery carries the NMI
@@ -167,10 +156,11 @@ pub(super) fn interrupt_window(state: ExitState, exit: &ExitInfo) -> (ExitEvent,
 /// reliable discriminator. Any other EPT violation, a stray repeat of either
 /// included, is [`ExitEvent::EptViolation`].
 pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {
-    let frame = exit.guest_physical & !0xFFF;
-    let protected_write = exit.protected_page != 0
-        && frame == exit.protected_page
-        && EptQualification(exit.qualification).is_protected_write();
+    let Some(fault) = exit.fault else {
+        return (ExitEvent::EptViolation, state);
+    };
+    let frame = fault.gpa & !0xFFF;
+    let protected_write = exit.protected_page != 0 && frame == exit.protected_page && fault.is_protected_write();
     if protected_write {
         if exit.stack_page != 0 && frame == exit.stack_page {
             // The push for the reinjected NMI faulted on the read-only stack page.
@@ -196,7 +186,7 @@ pub(super) fn ept_violation(state: ExitState, exit: &ExitInfo) -> (ExitEvent, Ex
     (ExitEvent::EptViolation, state)
 }
 
-/// VMCALL (exit reason 18): the guest's NMI handler, or its next main
+/// Hypercall (`ExitReason::Hypercall`): the guest's NMI handler, or its next main
 /// VMCALL. Main VMCALL #1 must come after the EPT violation and show the
 /// data page read back as planned.
 pub(super) fn vmcall(state: ExitState, exit: &ExitInfo) -> (ExitEvent, ExitState) {

@@ -14,6 +14,7 @@ use core::ptr::NonNull;
 use crate::hal::intel::vmcs::{self, VmcsError};
 use crate::x86::page::{PAGE_SIZE, allocate_zeroed_pages};
 
+pub mod decode;
 pub(crate) mod dump;
 
 /// VMREADs `field` of the current VMCS. For the exit handler and its
@@ -86,24 +87,8 @@ fn used_bytes(words: &[u64]) -> usize {
         .map_or(0, |lowest| (words.len() - lowest) * size_of::<u64>())
 }
 
-#[repr(C)]
-pub(crate) struct RegisterFrame {
-    pub(crate) rax: u64,
-    pub(crate) rbx: u64,
-    pub(crate) rcx: u64,
-    pub(crate) rdx: u64,
-    pub(crate) rsi: u64,
-    pub(crate) rdi: u64,
-    pub(crate) rbp: u64,
-    pub(crate) r8: u64,
-    pub(crate) r9: u64,
-    pub(crate) r10: u64,
-    pub(crate) r11: u64,
-    pub(crate) r12: u64,
-    pub(crate) r13: u64,
-    pub(crate) r14: u64,
-    pub(crate) r15: u64,
-}
+/// The guest's registers as the stub pushes them (`hal::types::GuestRegisters`).
+pub(crate) type RegisterFrame = crate::hal::types::GuestRegisters;
 
 // The entry stub pushes r15 first and rax last, so rax ends up at the lowest
 // address. Tie the struct layout to that order, so reordering a field or a

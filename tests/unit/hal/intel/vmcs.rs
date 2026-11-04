@@ -5,7 +5,7 @@
 //! private items.
 
 use super::*;
-use crate::x86::msr::ControlCapability;
+use crate::hal::intel::msr::ControlCapability;
 
 #[test]
 fn an_unsupported_control_is_a_vmcs_error() {

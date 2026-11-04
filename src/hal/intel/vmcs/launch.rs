@@ -36,7 +36,7 @@ use core::sync::atomic::AtomicU64;
 
 use super::fields::{GUEST_RFLAGS, GUEST_RIP, GUEST_RSP};
 use super::{VmcsError, instruction_error_for, launch_failure, resume_failure};
-use crate::hv::exit_decision::ExitReason;
+use crate::hal::intel::vmexit::decode::ExitReason;
 
 /// RSP inside `vmx_launch`, saved after it pushed the caller's registers;
 /// `vmx_return_to_launcher` reloads it to get back into that frame.

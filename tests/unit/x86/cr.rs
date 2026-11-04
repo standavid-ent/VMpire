@@ -1,4 +1,4 @@
-//! Unit tests for the control-register masking math in `src/vmx/cr.rs`.
+//! Unit tests for the control-register masking math in `src/x86/cr.rs`.
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its items.
@@ -7,11 +7,11 @@ use super::*;
 
 /// FIXED MSRs of the usual shape: CR0 fixes PE, NE and PG on (and the bits
 /// above 31 reserved as 0); CR4 fixes VMXE on and allows the common bits.
-const FIXED: CrFixed = CrFixed {
-    cr0_fixed0: 0x8000_0021,
-    cr0_fixed1: 0xFFFF_FFFF,
-    cr4_fixed0: CR4_VMXE,
-    cr4_fixed1: 0x2_7FFF,
+const FIXED: CrConstraints = CrConstraints {
+    cr0_must_be_one: 0x8000_0021,
+    cr0_may_be_one: 0xFFFF_FFFF,
+    cr4_must_be_one: CR4_VMXE,
+    cr4_may_be_one: 0x2_7FFF,
 };
 
 #[test]
@@ -27,11 +27,11 @@ fn owned_is_the_must_be_one_and_must_be_zero_bits() {
 fn legal_forces_the_fixed_bits() {
     // Clearing NE: the forced value keeps it set (FIXED0), reserved bits off.
     let requested = CR0_PE | CR0_PG;
-    let forced = legal(requested, FIXED.cr0_fixed0, FIXED.cr0_fixed1);
+    let forced = legal(requested, FIXED.cr0_must_be_one, FIXED.cr0_may_be_one);
     assert!(forced & CR0_NE != 0);
     assert_eq!(forced & !0xFFFF_FFFFu64, 0);
     // CR4 = 0 is forced to VMXE set.
-    assert_eq!(legal(0, FIXED.cr4_fixed0, FIXED.cr4_fixed1), CR4_VMXE);
+    assert_eq!(legal(0, FIXED.cr4_must_be_one, FIXED.cr4_may_be_one), CR4_VMXE);
 }
 
 #[test]

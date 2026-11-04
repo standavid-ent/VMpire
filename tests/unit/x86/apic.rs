@@ -5,7 +5,8 @@
 //! private items.
 
 use super::*;
-use crate::hal::intel::ept::{EPT_READ, EPT_RWX};
+use crate::hal::intel::ept::{EPT_EXECUTE, EPT_READ, EPT_RWX, EPT_WRITE};
+use crate::hal::types::Permissions;
 use crate::x86::paging::PageSize;
 
 /// The usual value on the bootstrap processor: base 0xFEE00000, xAPIC mode
@@ -63,7 +64,11 @@ fn ept(hpa: u64, access: u64, memory_type: MemoryType) -> WalkEnd {
     WalkEnd::Mapped {
         hpa,
         size: 1 << 30,
-        access,
+        permissions: Permissions {
+            read: access & EPT_READ != 0,
+            write: access & EPT_WRITE != 0,
+            execute: access & EPT_EXECUTE != 0,
+        },
         memory_type,
     }
 }

@@ -38,7 +38,7 @@ pub use handlers::fault_on_purpose;
 
 use core::ptr::NonNull;
 
-use crate::hal::intel::vmcs::{HostSelectors, HostTables};
+use crate::hal::types::{HostSelectors, HostTables};
 use crate::x86::context_tables::{TssError, TssRegion};
 use crate::x86::cpuid;
 use crate::x86::cr::read_cr4;
@@ -138,7 +138,7 @@ impl HostEnvironment {
     }
 
     /// The VMCS host fields that come from this environment.
-    pub fn vmcs_tables(&self) -> HostTables {
+    pub fn host_tables(&self) -> HostTables {
         HostTables {
             cr3: self.page_tables.cr3(),
             gdtr_base: self.gdt_base(),

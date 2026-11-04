@@ -45,10 +45,23 @@
 
 use core::fmt;
 
+use crate::hal::intel::msr;
 use crate::hal::intel::vmcs::{self, VmcsError, fields};
 use crate::x86::cr;
-use crate::x86::msr;
-use crate::x86::segment::{self, ACCESS_RIGHTS_UNUSABLE, DescriptorTable, SegmentDescriptor};
+use crate::x86::segment::{self, DescriptorTable, SegmentDescriptor};
+
+/// VMCS access-rights bit 16: the segment register is unusable, as after
+/// loading a null selector. VM entry then ignores the other bits.
+pub const ACCESS_RIGHTS_UNUSABLE: u32 = 1 << 16;
+
+impl SegmentDescriptor {
+    /// The access rights in VMCS format: descriptor bits 47:40 become bits
+    /// 7:0, descriptor bits 55:52 become bits 15:12, and the limit bits in
+    /// between (11:8 here) are cleared, since VM entry requires them to be 0.
+    pub fn access_rights(self) -> u32 {
+        (self.0 >> 40) as u32 & 0xF0FF
+    }
+}
 
 /// RFLAGS bit 1 is reserved and must be 1; every other bit is 0.
 const INITIAL_RFLAGS: u64 = 0x2;
@@ -206,20 +219,7 @@ pub enum GuestStateError {
     Vmcs { field: u32, error: VmcsError },
 }
 
-/// Where the guest starts: the part of its state that is not a copy of the
-/// running CPU's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuestEntry {
-    /// At `rip` on the stack `rsp`, with interrupts off (RFLAGS `0x2`) and the
-    /// IDT `idtr`: the built-in test guest.
-    At { rip: u64, rsp: u64, idtr: DescriptorTable },
-    /// In place: the code after VMLAUNCH goes on as the guest, on the stack
-    /// it runs on, with the RFLAGS it has there, and the IDT `idtr`, the
-    /// firmware's. Only VMLAUNCH knows that RIP, RSP and RFLAGS, so
-    /// `vmcs::launch_in_place` writes them; until then the fields hold
-    /// placeholders: 0, 0 and `0x2`.
-    InPlace { idtr: DescriptorTable },
-}
+pub use crate::hal::types::GuestEntry;
 
 impl GuestEntry {
     /// GUEST_RIP, GUEST_RSP and GUEST_RFLAGS to write before VMLAUNCH.

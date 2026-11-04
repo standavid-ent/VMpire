@@ -1,15 +1,15 @@
-//! The VM-exit handler the entry stub calls: read the exit, judge it, carry
-//! it out, report it.
+//! The VM-exit handler the backend's exit path calls: read the exit, judge
+//! it, carry it out, report it.
 //!
-//! [`vmexit_handler`] runs four steps:
+//! [`handle_exit`] runs four steps:
 //!
-//! 1. [`read_exit`] reads the exit's VMCS fields and the guest registers.
-//!    It prints nothing.
+//! 1. [`read_exit`] reads the exit through the backend's readers
+//!    (`hal::VmExit`) and the guest registers. It prints nothing.
 //! 2. [`judge`] folds in an NMI that arrived while Aleph0 ran (`crate::host`)
 //!    and passes the exit to `exit_decision::decide` with the state kept
 //!    between exits.
-//! 3. [`carry_out`] executes an emulated instruction and prepares the VMCS as
-//!    the event's `ResumePlan` says, or stops the guest. It prints nothing
+//! 3. [`carry_out`] executes an emulated instruction and prepares the guest
+//!    as the event's `ResumePlan` says, or stops the guest. It prints nothing
 //!    either: a step that fails says why in its [`ResumeFailure`].
 //! 4. `report.rs` prints the exit and its [`Outcome`], once everything about
 //!    the exit is known, in as much detail as the print policy gives it
@@ -23,34 +23,33 @@ use core::fmt;
 
 use super::guest_mtrrs::{self, MtrrAccessFailure, MtrrWrite};
 use super::history::{self, ExitRecord};
-use super::policy::{self, COUNTERS, MAX_LEVEL, exit_detail};
-use super::report::{ExitReport, after_stop, report_exit, report_stop};
+use super::policy::{self, COUNTERS, MAX_LEVEL, OTHER_REASONS, exit_detail};
+use super::report::{ExitReport, report_exit, report_stop};
 use super::stats::{self, VcpuStats};
-use super::{RegisterFrame, read_field};
-use crate::hal::intel::ept::{self, InveptType, ProtectedPage};
-use crate::hal::intel::instruction::VmxFail;
-use crate::hal::intel::vmcs::fields::{
-    CR0_READ_SHADOW, CR4_READ_SHADOW, EXIT_QUALIFICATION, GUEST_CR0, GUEST_CR4, GUEST_INTERRUPTIBILITY_STATE,
-    GUEST_PHYSICAL_ADDRESS, GUEST_RIP, GUEST_RSP, GUEST_SS_ACCESS_RIGHTS, IDT_VECTORING_ERROR_CODE, IDT_VECTORING_INFO,
-    VM_ENTRY_EXCEPTION_ERROR_CODE, VM_ENTRY_INSTRUCTION_LEN, VM_ENTRY_INTERRUPTION_INFO, VM_EXIT_INSTRUCTION_LEN,
-    VM_EXIT_INTERRUPTION_INFO, VM_EXIT_REASON,
+use crate::hal::types::{
+    CrConstraints, ExitReason, Flush, GuestKind, GuestRegisters as RegisterFrame, InjectedEvent, Interruptibility,
 };
-use crate::hal::intel::vmcs::{self, GuestKind, VmcsError, encode_finished, encode_resume_failed, encode_unexpected};
+use crate::hal::{HardwareVirtualization as _, NestedPaging as _, VmExit as _, backend};
 use crate::host;
 use crate::hv::exit_decision::{
-    CrNumber, CrQualification, EXIT_REASON_CONTROL_REGISTER, EXIT_REASON_CPUID, EXIT_REASON_EPT_MISCONFIG,
-    EXIT_REASON_EPT_VIOLATION, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_VMCALL, Emulation, ExitAction, ExitEvent,
-    ExitInfo, ExitReason, ExitState, InterruptionInfo, IoSize, Redelivery, ResumePlan, UNREADABLE_REASON, cpl_from_ss,
-    cpuid_policy, decide, is_canonical_48, merge_in,
+    Emulation, ExitAction, ExitEvent, ExitInfo, ExitState, IoSize, ResumePlan, cpuid_policy, decide, is_canonical_48,
+    merge_in,
 };
 use crate::hv::features;
 use crate::hv::hyperv::{self, HypercallRegisters};
 use crate::output::Phase;
 use crate::port;
-use crate::x86::cr::{self, CrFixed};
+use crate::x86::cr;
 use crate::x86::msr;
 use crate::x86::mtrr::MtrrMsr;
 use crate::x86::page;
+
+/// The backend's error for a field it could not read or write.
+type FieldError = <backend::VmExit as crate::hal::VmExit>::Error;
+/// The backend's protected page.
+type ProtectedPage = <backend::NestedPaging as crate::hal::NestedPaging>::ProtectedPage;
+/// The backend's error for a flush that failed.
+type FlushError = <backend::NestedPaging as crate::hal::NestedPaging>::FlushError;
 
 /// Exits so far per basic reason ([`policy::counter`]), including the
 /// current one: for the print policy and the histogram every stop prints.
@@ -60,8 +59,8 @@ static EXITS_BY_REASON: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; CO
 
 /// Counts an exit of basic reason `basic`, and returns how many there have
 /// been, this one included.
-fn count_exit(basic: u16) -> u64 {
-    EXITS_BY_REASON[policy::counter(basic)].fetch_add(1, Ordering::Relaxed) + 1
+fn count_exit(slot: usize) -> u64 {
+    EXITS_BY_REASON[slot].fetch_add(1, Ordering::Relaxed) + 1
 }
 
 /// The counts of [`EXITS_BY_REASON`] as they stand.
@@ -95,20 +94,6 @@ fn store_state(state: ExitState) {
     NMI_STACK_GRANTS.store(state.nmi_stack_grants, Ordering::Relaxed);
 }
 
-/// Handler return value that tells the entry stub to resume the guest.
-/// Every other value is a stop value (see `vmx/vmcs/launch.rs`).
-const RESUME_GUEST: u64 = 0;
-
-/// What the handler returns to the entry stub for `action` at exit
-/// `number`: [`RESUME_GUEST`], or the stop value `vmcs::launch` returns.
-fn stub_return(action: ExitAction, number: u64, raw_reason: u32) -> u64 {
-    match action {
-        ExitAction::Resume(_) => RESUME_GUEST,
-        ExitAction::Finished => encode_finished(number),
-        ExitAction::Unexpected => encode_unexpected(number, raw_reason),
-    }
-}
-
 /// The guest RIP after an instruction of `length` bytes, or `None` when that would wrap past the top of the
 /// address space or land outside the canonical range.
 ///
@@ -121,10 +106,10 @@ fn next_rip(rip: u64, length: u64) -> Option<u64> {
 }
 
 /// The value a MOV to CR0/CR4 loads, from the general-purpose register
-/// `number` names (`CrQualification::gpr`). RSP (4) is not in `frame`; it is
-/// GUEST_RSP, read only for a control-register exit (`rsp`). Returns `None`
-/// when the source is RSP but GUEST_RSP was unreadable.
-fn cr_source_value(number: u8, frame: &RegisterFrame, rsp: Option<Result<u64, VmcsError>>) -> Option<u64> {
+/// `number` names (`CrAccess::gpr`). RSP (4) is not in `frame`; it is the
+/// guest's RSP, read only for a control-register exit (`rsp`). Returns
+/// `None` when the source is RSP but the guest's RSP was unreadable.
+fn cr_source_value(number: u8, frame: &RegisterFrame, rsp: Option<Result<u64, FieldError>>) -> Option<u64> {
     Some(match number {
         0 => frame.rax,
         1 => frame.rcx,
@@ -141,37 +126,27 @@ fn cr_source_value(number: u8, frame: &RegisterFrame, rsp: Option<Result<u64, Vm
         12 => frame.r12,
         13 => frame.r13,
         14 => frame.r14,
-        // `number` is 4 bits (`CrQualification::gpr`), so the last is R15.
+        // `number` is 4 bits (`CrAccess::gpr`), so the last is R15.
         _ => frame.r15,
     })
 }
 
-/// The GUEST_CRn and CRn_READ_SHADOW field encodings for `cr`.
-fn cr_write_fields(cr: CrNumber) -> (u32, u32) {
-    match cr {
-        CrNumber::Cr0 => (GUEST_CR0, CR0_READ_SHADOW),
-        CrNumber::Cr4 => (GUEST_CR4, CR4_READ_SHADOW),
-    }
-}
-
-/// VM-exit handler: decides what the exit is (`exit_decision::decide`),
-/// carries that out, prints the exit over serial, then tells the entry stub
-/// what to do. It returns [`RESUME_GUEST`] after preparing the VMCS for the
-/// guest to go on (the stub then executes VMRESUME), or, for the test guest,
-/// a stop value (the stub then returns it from `vmcs::launch` to bring-up).
-/// A stop of the firmware halts here ([`halt_unless_returnable`]).
+/// The VM-exit handler: decides what the exit is (`exit_decision::decide`),
+/// carries that out, prints the exit over serial, and returns what the
+/// backend's exit path does next with the exit's number: resume the guest
+/// (its state prepared to go on), or, for the test guest, stop it. A stop of
+/// the firmware halts here ([`halt_unless_returnable`]).
 ///
-/// Runs on the VM-exit stack with interrupts off. It may only use things
-/// that need no firmware: VMREAD/VMWRITE (the VMCS is still current) and the
-/// serial port. `uefi::println!` must not be called here; `log!` and the
-/// panic handler skip the console once the phase below is set. For an
-/// emulated instruction it also writes the result into the guest's registers
-/// in `frame`.
-#[unsafe(no_mangle)]
-extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
+/// Runs in exit context with interrupts off. It may only use things that
+/// need no firmware: the backend's exit (`exit`) and the serial port.
+/// `uefi::println!` must not be called here; `log!` and the panic handler
+/// skip the console once the phase below is set. For an emulated
+/// instruction it also writes the result into the guest's registers in
+/// `frame`.
+pub fn handle_exit(exit: &mut backend::VmExit, frame: &mut RegisterFrame) -> (ExitAction, u64) {
     // First, so every line below (and any panic) skips the firmware console.
     // Put back when the guest resumes ([`resume_phase`]). After a stop that
-    // returns, bring-up switches it back once it has left VMX operation.
+    // returns, bring-up switches it back once it has left root mode.
     let phase = crate::output::set_phase(Phase::VmExit);
     #[cfg(feature = "host-fault-test")]
     host::fault_on_purpose();
@@ -180,23 +155,25 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
 
     let guest = GuestKind::SELECTED;
     let number = stats::update(VcpuStats::count_exit);
-    // SAFETY: the entry stub passes a pointer to the frame it just pushed on
-    // the exit stack. It stays put until this returns and nothing else
-    // touches it meanwhile; the stub pops it into the guest's registers
-    // afterwards, so writes here reach the guest.
-    let frame = unsafe { &mut *frame };
-    let read = read_exit(frame);
+    let read = read_exit(exit, frame);
     let host_nmi = host::take_pending_nmi();
     let (event, next) = judge(guest, read.exit, host_nmi);
-    let outcome = carry_out(event, &read, next, frame);
+    let outcome = carry_out(event, &read, next, frame, exit);
     if let Outcome::Resumed { plan, .. } = outcome {
         stats::update(|stats| stats.count_resumed(event, plan));
         stats::update_forwarded(|forwarded| forwarded.count(plan.emulate));
     }
     // Before anything prints, so a panic while printing still shows this exit.
-    history::record(read.record(number, event));
-    let basic = read.reason().map_or(UNREADABLE_REASON, |reason| reason.basic);
-    let count = count_exit(basic);
+    history::record(ExitRecord {
+        number,
+        raw: exit.record(),
+        registers: read.registers,
+        event,
+    });
+    let slot = read.reason_code.map_or(OTHER_REASONS, |code| {
+        policy::counter(backend::VmExit::describe_reason(code).number)
+    });
+    let count = count_exit(slot);
     report_exit(&ExitReport {
         guest,
         number,
@@ -204,29 +181,30 @@ extern "efiapi" fn vmexit_handler(frame: *mut RegisterFrame) -> u64 {
         detail: exit_detail(
             count,
             outcome.stops(),
-            read.unreadable(),
+            exit.unreadable(),
             event == ExitEvent::BootServicesEnded,
             MAX_LEVEL,
         ),
         read: &read,
+        exit,
         host_nmi,
         event,
         next,
         outcome,
     });
     if outcome.stops() {
-        report_stop(number, frame, &exits_by_reason());
+        report_stop(number, frame, &exits_by_reason(), exit);
         halt_unless_returnable(guest);
     } else {
         #[cfg(feature = "host-nmi-test")]
         if event == ExitEvent::MainVmcall {
             wait_for_host_nmi(number);
         }
-        // Last, after every VMCS write of this exit.
-        keep_nmi_window_for_host_nmi(number);
+        // Last, after every change of this exit.
+        keep_nmi_window_for_host_nmi(number, exit);
         crate::output::set_phase(resume_phase(event, phase));
     }
-    stub_return(outcome.action(), number, read.raw_reason())
+    (outcome.action(), number)
 }
 
 /// The output phase the guest resumes in after `event`: the one the exit
@@ -242,218 +220,157 @@ fn resume_phase(event: ExitEvent, found: Phase) -> Phase {
 
 /// Halts after a stop of a `guest` whose stop cannot return to bring-up
 /// (`GuestKind::stop_returns_to_bring_up`): the firmware, launched in place,
-/// has reused the stack `vmcs::launch_in_place` ran on, and no frame was
-/// saved to jump back to. The stop's report is already on serial.
+/// has reused the stack `Vcpu::run_in_place` ran on, and no frame was saved
+/// to jump back to. The stop's report is already on serial.
 fn halt_unless_returnable(guest: GuestKind) {
     if !guest.stop_returns_to_bring_up() {
         crate::output::halt_forever();
     }
 }
 
-/// What [`read_exit`] read about one exit. Each VMCS field keeps its VMREAD
-/// result, so the report can show an unreadable one where it belongs.
+/// What [`read_exit`] read about one exit, through the backend's readers;
+/// the backend keeps every field it read for its own report lines.
 pub(super) struct ExitRead {
-    /// VM_EXIT_REASON.
-    pub(super) reason: Result<u64, VmcsError>,
-    /// VM_EXIT_INTERRUPTION_INFO.
-    pub(super) interruption_info: Result<u64, VmcsError>,
-    /// EXIT_QUALIFICATION.
-    pub(super) qualification: Result<u64, VmcsError>,
-    /// GUEST_PHYSICAL_ADDRESS, read for EPT exits only (`None` for others).
-    pub(super) guest_physical: Option<Result<u64, VmcsError>>,
-    /// GUEST_SS_ACCESS_RIGHTS, the CPL, read for VMCALL exits only.
-    pub(super) ss_access_rights: Option<Result<u64, VmcsError>>,
-    /// GUEST_RIP.
-    pub(super) rip: Result<u64, VmcsError>,
-    /// VM_EXIT_INSTRUCTION_LEN.
-    pub(super) length: Result<u64, VmcsError>,
-    /// GUEST_INTERRUPTIBILITY_STATE.
-    pub(super) interruptibility: Result<u64, VmcsError>,
-    /// IDT_VECTORING_INFO.
-    pub(super) idt_vectoring: Result<u64, VmcsError>,
-    /// The guest's RAX, RBX, RCX and RDX as the stub saved them, before an
-    /// emulated instruction changes them.
+    /// The exit's reason.
+    pub(super) reason: Result<ExitReason, FieldError>,
+    /// The backend's raw reason code, for the counters and the stop value.
+    pub(super) reason_code: Result<u32, FieldError>,
+    /// Where the guest stopped.
+    pub(super) rip: Result<u64, FieldError>,
+    /// The exiting instruction's length.
+    pub(super) length: Result<u64, FieldError>,
+    /// The guest's RAX, RBX, RCX and RDX as the exit path saved them, before
+    /// an emulated instruction changes them.
     ///
-    /// The stub pushed them just below HOST_RSP; after a normal exit they are
-    /// the guest's values. After a VM-entry failure (exit reason bit 31) the
-    /// guest never ran, so they are whatever was live when entry was
-    /// attempted: the host's registers for VMLAUNCH, or the restored guest
-    /// registers (the previous exit's) for VMRESUME. Either way, not this
-    /// exit's guest.
+    /// After a VM-entry failure the guest never ran, so they are whatever was
+    /// live when entry was attempted: the host's registers for the first
+    /// entry, or the restored guest registers (the previous exit's) for a
+    /// resume. Either way, not this exit's guest.
     pub(super) registers: [u64; 4],
-    /// The page EPT protects, for granting write.
+    /// The page the nested page tables protect, for granting write.
     protected: Option<ProtectedPage>,
     /// Everything `decide` needs, `None` if a field it needs was unreadable.
     pub(super) exit: Option<ExitInfo>,
 }
 
-impl ExitRead {
-    /// The exit reason, if VM_EXIT_REASON was readable.
-    pub(super) fn reason(&self) -> Option<ExitReason> {
-        self.reason.ok().map(|raw| ExitReason::from_raw(raw as u32))
-    }
-
-    /// VM_EXIT_REASON for the stop value, or [`UNREADABLE_REASON`].
-    fn raw_reason(&self) -> u32 {
-        self.reason.map_or(u32::from(UNREADABLE_REASON), |raw| raw as u32)
-    }
-
-    /// This exit, number `number`, as the history keeps it, with what
-    /// `decide` made of it (`event`).
-    fn record(&self, number: u64, event: ExitEvent) -> ExitRecord {
-        ExitRecord {
-            number,
-            reason: self.reason.ok().map(|raw| raw as u32),
-            qualification: self.qualification.ok(),
-            rip: self.rip.ok(),
-            length: self.length.ok(),
-            interruption_info: self.interruption_info.ok().map(|info| info as u32),
-            idt_vectoring_info: self.idt_vectoring.ok().map(|info| info as u32),
-            registers: self.registers,
-            event,
-        }
-    }
-
-    /// Whether a VMCS field the handler read could not be read.
-    fn unreadable(&self) -> bool {
-        [
-            self.reason,
-            self.interruption_info,
-            self.qualification,
-            self.guest_physical.unwrap_or(Ok(0)),
-            self.ss_access_rights.unwrap_or(Ok(0)),
-            self.rip,
-            self.length,
-            self.interruptibility,
-            self.idt_vectoring,
-        ]
-        .iter()
-        .any(Result::is_err)
-    }
-}
-
-/// Reads the exit's VMCS fields and the guest registers, and collects what
-/// [`judge`] and [`carry_out`] need. Prints nothing.
-fn read_exit(frame: &RegisterFrame) -> ExitRead {
-    let reason = read_field(VM_EXIT_REASON);
-    let decoded = reason.ok().map(|raw| ExitReason::from_raw(raw as u32));
-    let interruption_info = read_field(VM_EXIT_INTERRUPTION_INFO);
-    let qualification = read_field(EXIT_QUALIFICATION);
-    let ept_exit = decoded.is_some_and(|reason| {
-        !reason.entry_failure && matches!(reason.basic, EXIT_REASON_EPT_VIOLATION | EXIT_REASON_EPT_MISCONFIG)
-    });
-    let guest_physical = ept_exit.then(|| read_field(GUEST_PHYSICAL_ADDRESS));
-    // Only a VMCALL is judged by the CPL; 0 otherwise, which `decide` never
-    // looks at, and an unreadable one leaves the VMCALL unjudged.
-    let vmcall_exit = decoded.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_VMCALL);
-    let ss_access_rights = vmcall_exit.then(|| read_field(GUEST_SS_ACCESS_RIGHTS));
-    let guest_cpl = ss_access_rights.map_or(Some(0), |rights| rights.ok().map(cpl_from_ss));
-    // Only a MOV to CR0/CR4 (reason 28) needs the FIXED MSRs, GUEST_RSP (for a
-    // write sourced from RSP) and the source value; `decide` ignores them for
-    // any other exit.
-    let cr_access_exit =
-        decoded.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_CONTROL_REGISTER);
-    let cr_fixed = if cr_access_exit {
-        // SAFETY: exit context implies VMX operation, so the FIXED MSRs exist.
-        unsafe { CrFixed::read() }
-    } else {
-        CrFixed::NONE
-    };
-    let guest_rsp = cr_access_exit.then(|| read_field(GUEST_RSP));
-    // The value the MOV loads; `None` only if its source is RSP and GUEST_RSP
-    // was unreadable, which leaves the exit unjudged. `Some(0)` for any other
-    // exit, which `decide` never looks at.
-    let cr_source = if cr_access_exit {
-        match qualification {
-            Ok(qualification) => cr_source_value(CrQualification(qualification).gpr(), frame, guest_rsp),
-            Err(_) => None,
-        }
+/// Reads the exit through the backend's readers and the guest registers,
+/// and collects what [`judge`] and [`carry_out`] need. Prints nothing.
+fn read_exit(exit: &backend::VmExit, frame: &RegisterFrame) -> ExitRead {
+    let reason = exit.reason();
+    let reason_code = exit.reason_code();
+    let decoded = reason.ok();
+    let event = exit.exception_or_nmi();
+    let nested_exit = matches!(
+        decoded,
+        Some(ExitReason::NestedPageFault | ExitReason::NestedPagingMisconfig)
+    );
+    let fault = nested_exit.then(|| exit.nested_page_fault());
+    // Only a hypercall is judged by the CPL; 0 otherwise, which `decide`
+    // never looks at, and an unreadable one leaves the hypercall unjudged.
+    let guest_cpl = if decoded == Some(ExitReason::Hypercall) {
+        exit.guest_cpl().ok()
     } else {
         Some(0)
+    };
+    // Only a MOV to CR0/CR4 needs the CR constraints, the guest's RSP (for a
+    // write sourced from RSP) and the source value; `decide` ignores them for
+    // any other exit.
+    let cr_access_exit = decoded == Some(ExitReason::ControlRegisterAccess);
+    let cr_constraints = if cr_access_exit {
+        // SAFETY: exit context implies root mode, so the extension is
+        // supported.
+        unsafe { backend::HardwareVirtualization::cr_constraints() }
+    } else {
+        CrConstraints::NONE
+    };
+    let cr_access = cr_access_exit.then(|| exit.cr_access());
+    let guest_rsp = cr_access_exit.then(|| exit.guest_rsp());
+    // The value the MOV loads; `None` only if its source is RSP and the
+    // guest's RSP was unreadable, which leaves the exit unjudged. `Some(0)`
+    // for any other exit, which `decide` never looks at.
+    let cr_source = match cr_access {
+        Some(Ok(access)) => cr_source_value(access.gpr, frame, guest_rsp),
+        Some(Err(_)) => None,
+        None => Some(0),
     };
     // Only CPUID copies the guest's CR4 (OSXSAVE, PKE); an unreadable one
     // leaves the CPUID unjudged, and 0 stands in for any other exit.
-    let cpuid_exit = decoded.is_some_and(|reason| !reason.entry_failure && reason.basic == EXIT_REASON_CPUID);
-    let guest_cr4 = if cpuid_exit {
-        read_field(GUEST_CR4).ok()
+    let guest_cr4 = if decoded == Some(ExitReason::Cpuid) {
+        exit.guest_cr4().ok()
     } else {
         Some(0)
     };
-    let rip = read_field(GUEST_RIP);
-    let length = read_field(VM_EXIT_INSTRUCTION_LEN);
-    let interruptibility = read_field(GUEST_INTERRUPTIBILITY_STATE);
-    let idt_vectoring = read_field(IDT_VECTORING_INFO);
-    // The read-only page this exit's access fell in, if any: an EPT exit
-    // whose GUEST_PHYSICAL_ADDRESS is one of the published protected pages
-    // (the data page, or the NMI-delivery stack page). The grant path makes
-    // exactly this page writable.
-    let protected = guest_physical
-        .and_then(|gpa| gpa.ok())
-        .and_then(ept::protected_page_for);
+    let io_access = (decoded == Some(ExitReason::IoInstruction)).then(|| exit.io_access());
+    let rip = exit.guest_rip();
+    let length = exit.instruction_length();
+    let interruptibility = exit.interruptibility();
+    let interrupted = exit.interrupted_event();
+    let faulted_nmi_unblocking_iret = exit.faulted_nmi_unblocking_iret();
+    // The read-only page this exit's access fell in, if any: a nested page
+    // fault whose GPA is one of the published protected pages (the data
+    // page, or the NMI-delivery stack page). The grant path makes exactly
+    // this page writable.
+    let protected = fault
+        .and_then(Result::ok)
+        .and_then(|fault| backend::NestedPaging::protected_page_for(fault.gpa));
     let mtrr = guest_mtrrs::capabilities();
 
-    // Only EPT, I/O and control-register exits are judged by
-    // EXIT_QUALIFICATION. For any other exit an unreadable one (reported
-    // later) does not matter.
-    let judged_by_qualification = ept_exit
-        || decoded.is_some_and(|reason| {
-            !reason.entry_failure && matches!(reason.basic, EXIT_REASON_IO_INSTRUCTION | EXIT_REASON_CONTROL_REGISTER)
-        });
-    let qualification_for_decide = if judged_by_qualification {
-        qualification.ok()
-    } else {
-        Some(qualification.unwrap_or(0))
-    };
-    // Meaningful only when idt_vectoring is valid and carries an error code;
-    // 0 otherwise, so an unreadable field never stops an exit that ignores it.
-    let idt_vectoring_error_code = read_field(IDT_VECTORING_ERROR_CODE).unwrap_or(0) as u32;
-    // Meaningful only for EPT exits; decide never looks at it otherwise.
-    let guest_physical_for_decide = guest_physical.map_or(Some(0), Result::ok);
-    let exit = match (
+    // An optional detail is `Some(None)` when the exit does not have it,
+    // `None` when it was unreadable: then the exit cannot be judged.
+    fn detail<T, E>(value: Option<Result<T, E>>) -> Option<Option<T>> {
+        match value {
+            Some(Ok(value)) => Some(Some(value)),
+            Some(Err(_)) => None,
+            None => Some(None),
+        }
+    }
+    let exit_info = match (
         decoded,
-        interruption_info.ok(),
+        event.ok(),
         interruptibility.ok(),
-        idt_vectoring.ok(),
-        qualification_for_decide,
-        guest_physical_for_decide,
+        interrupted.ok(),
+        faulted_nmi_unblocking_iret.ok(),
+        detail(cr_access),
+        detail(io_access),
+        detail(fault),
         guest_cpl,
         cr_source,
         guest_cr4,
     ) {
         (
             Some(reason),
-            Some(info),
-            Some(blocking),
-            Some(vectoring),
-            Some(qualification),
-            Some(guest_physical),
+            Some(event),
+            Some(interruptibility),
+            Some(interrupted),
+            Some(faulted_nmi_unblocking_iret),
+            Some(cr_access),
+            Some(io_access),
+            Some(fault),
             Some(guest_cpl),
             Some(cr_source),
             Some(guest_cr4),
-        ) => {
-            Some(ExitInfo {
-                reason,
-                interruption_info: InterruptionInfo(info as u32),
-                guest_rax: frame.rax,
-                guest_rcx: frame.rcx,
-                guest_rdx: frame.rdx,
-                interruptibility: blocking as u32,
-                // IDT_VECTORING_INFO has the interruption-information layout.
-                idt_vectoring: InterruptionInfo(vectoring as u32),
-                idt_vectoring_error_code,
-                qualification,
-                guest_physical,
-                protected_page: protected.map_or(0, |page| page.gpa),
-                stack_page: ept::nmi_stack_page(),
-                mtrr,
-                hyperv: hyperv::offered(),
-                guest_cpl,
-                cr_source,
-                cr_fixed,
-                guest_cr4,
-                xcr0_supported: features::published().xcr0,
-            })
-        }
+        ) => Some(ExitInfo {
+            reason,
+            event,
+            guest_rax: frame.rax,
+            guest_rcx: frame.rcx,
+            guest_rdx: frame.rdx,
+            interruptibility,
+            interrupted,
+            cr_access,
+            io_access,
+            fault,
+            faulted_nmi_unblocking_iret,
+            protected_page: protected.map_or(0, backend::NestedPaging::protected_page_gpa),
+            stack_page: backend::NestedPaging::nmi_stack_page(),
+            mtrr,
+            hyperv: hyperv::offered(),
+            guest_cpl,
+            cr_source,
+            cr_constraints,
+            guest_cr4,
+            xcr0_supported: features::published().xcr0,
+        }),
         // An unreadable field is reported later; without it the exit cannot
         // be judged.
         _ => None,
@@ -461,17 +378,12 @@ fn read_exit(frame: &RegisterFrame) -> ExitRead {
 
     ExitRead {
         reason,
-        interruption_info,
-        qualification,
-        guest_physical,
-        ss_access_rights,
+        reason_code,
         rip,
         length,
-        interruptibility,
-        idt_vectoring,
         registers: [frame.rax, frame.rbx, frame.rcx, frame.rdx],
         protected,
-        exit,
+        exit: exit_info,
     }
 }
 
@@ -518,7 +430,13 @@ impl Outcome {
 
 /// Carries out `event`: prepares the guest to resume as its plan says, or
 /// stops it. `next` is the state after the exit. Prints nothing.
-fn carry_out(event: ExitEvent, read: &ExitRead, next: ExitState, frame: &mut RegisterFrame) -> Outcome {
+fn carry_out(
+    event: ExitEvent,
+    read: &ExitRead,
+    next: ExitState,
+    frame: &mut RegisterFrame,
+    exit: &mut backend::VmExit,
+) -> Outcome {
     match event.action() {
         ExitAction::Resume(plan) => {
             let plan = plan.keeping_pending_nmi(next);
@@ -539,7 +457,7 @@ fn carry_out(event: ExitEvent, read: &ExitRead, next: ExitState, frame: &mut Reg
                 None => Some(plan),
             };
             match plan {
-                Some(plan) => match prepare_resume(read, plan, frame) {
+                Some(plan) => match prepare_resume(read, plan, frame, exit) {
                     Ok((plan, resumed)) => Outcome::Resumed { plan, resumed },
                     Err(failure) => Outcome::ResumeFailed(failure),
                 },
@@ -555,7 +473,7 @@ fn carry_out(event: ExitEvent, read: &ExitRead, next: ExitState, frame: &mut Reg
 /// of the primary controls in [`prepare_resume`] may have replaced its
 /// write; nothing writes them after this, so the guest exits to take the
 /// NMI as soon as it can.
-fn keep_nmi_window_for_host_nmi(number: u64) {
+fn keep_nmi_window_for_host_nmi(number: u64, exit: &mut backend::VmExit) {
     if !host::nmi_pending() {
         return;
     }
@@ -563,10 +481,7 @@ fn keep_nmi_window_for_host_nmi(number: u64) {
         "{} VM exit #{number}: an NMI arrived in root operation during this exit; NMI-window exiting on.",
         crate::TAG
     );
-    // SAFETY: exit context: VMX root operation, with the guest's VMCS
-    // current. `configure_controls` checked that the CPU allows NMI-window
-    // exiting.
-    if let Err(error) = unsafe { vmcs::set_nmi_window_exiting(true) } {
+    if let Err(error) = exit.set_nmi_window(true) {
         crate::serial_println!(
             "{} VM exit #{number}: could not turn NMI-window exiting on ({error:?}); the NMI waits for the next exit.",
             crate::TAG
@@ -641,13 +556,13 @@ pub(super) enum EmulationOutcome {
     /// guest gets at its own instruction instead.
     Refused {
         emulation: Emulation,
-        exception: InterruptionInfo,
+        exception: InjectedEvent,
     },
 }
 
 impl EmulationOutcome {
     /// The exception the guest gets when Hyper-V refused the access.
-    fn refused(self) -> Option<InterruptionInfo> {
+    fn refused(self) -> Option<InjectedEvent> {
         match self {
             Self::Refused { exception, .. } => Some(exception),
             _ => None,
@@ -777,7 +692,7 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
             // at the guest's VMCALL, instead of forwarding.
             EmulationOutcome::Refused {
                 emulation,
-                exception: InterruptionInfo::GENERAL_PROTECTION,
+                exception: InjectedEvent::GENERAL_PROTECTION,
             }
         }
         Emulation::Hypercall { input } => {
@@ -804,7 +719,7 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
                 }
                 Err(_) => EmulationOutcome::Refused {
                     emulation,
-                    exception: InterruptionInfo::INVALID_OPCODE,
+                    exception: InjectedEvent::INVALID_OPCODE,
                 },
             }
         }
@@ -820,7 +735,7 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
                 }
                 Err(_) => EmulationOutcome::Refused {
                     emulation,
-                    exception: InterruptionInfo::GENERAL_PROTECTION,
+                    exception: InjectedEvent::GENERAL_PROTECTION,
                 },
             }
         }
@@ -830,7 +745,7 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
             // refuse with #GP at the guest's WRMSR instead of forwarding.
             EmulationOutcome::Refused {
                 emulation,
-                exception: InterruptionInfo::GENERAL_PROTECTION,
+                exception: InjectedEvent::GENERAL_PROTECTION,
             }
         }
         Emulation::SyntheticWrite { msr, value } => {
@@ -839,7 +754,7 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
                 Ok(()) => EmulationOutcome::SyntheticWrite { msr, value },
                 Err(_) => EmulationOutcome::Refused {
                     emulation,
-                    exception: InterruptionInfo::GENERAL_PROTECTION,
+                    exception: InjectedEvent::GENERAL_PROTECTION,
                 },
             }
         }
@@ -851,8 +766,8 @@ fn execute(emulation: Emulation, frame: &mut RegisterFrame) -> Result<EmulationO
 pub(super) struct Resumed {
     /// Where the guest resumes.
     pub(super) rip: u64,
-    /// The INVEPT type used, if the protected page was made writable.
-    pub(super) invept: Option<InveptType>,
+    /// The flush used, if the protected page was made writable.
+    pub(super) invept: Option<Flush>,
     /// What the emulated instruction did, if the plan emulated one.
     pub(super) emulated: Option<EmulationOutcome>,
 }
@@ -870,11 +785,11 @@ pub(super) enum ResumeFailure {
     /// non-canonical ([`next_rip`]).
     NextRipInvalid,
     /// A VMWRITE the plan needs failed; `what` names the step.
-    Write { what: &'static str, error: VmcsError },
+    Write { what: &'static str, error: FieldError },
     /// The plan makes the protected page writable, but there is none.
     NoProtectedPage,
-    /// INVEPT failed after the protected page was made writable.
-    GrantWrite(VmxFail),
+    /// The flush failed after the protected page was made writable.
+    GrantWrite(FlushError),
     /// RDMSR or WRMSR of the guest's MTRRs failed.
     GuestMtrrs(MtrrAccessFailure),
     /// The exit interrupted an event's delivery, but this exit's plan already
@@ -892,7 +807,11 @@ impl fmt::Display for ResumeFailure {
             Self::NextRipInvalid => f.write_str("next guest RIP would wrap or be non-canonical"),
             Self::Write { what, error } => write!(f, "could not {what} ({error:?})"),
             Self::NoProtectedPage => f.write_str("no protected page to make writable"),
-            Self::GrantWrite(error) => write!(f, "could not make the protected page writable (INVEPT {error:?})"),
+            Self::GrantWrite(error) => write!(
+                f,
+                "could not make the protected page writable ({} {error:?})",
+                backend::NestedPaging::FLUSH
+            ),
             Self::GuestMtrrs(failure) => write!(f, "{failure}"),
             Self::RedeliveryConflict => f.write_str(
                 "an interrupted event cannot be re-delivered while the exit advances RIP or injects its own event",
@@ -901,14 +820,8 @@ impl fmt::Display for ResumeFailure {
     }
 }
 
-/// VMWRITEs `value` to `field` for a resume plan; `what` names the step if
-/// it fails.
-fn write_for_resume(field: u32, value: u64, what: &'static str) -> Result<(), ResumeFailure> {
-    // SAFETY: exit context: VMX root operation, with the guest's VMCS current.
-    unsafe { vmcs::vmwrite(field, value) }.map_err(|error| ResumeFailure::Write { what, error })
-}
-
-/// Prepares the VMCS (and EPT) as `plan` says: executes the emulated
+/// Prepares the guest (and the nested page tables) as `plan` says, through
+/// the backend's `exit`: executes the emulated
 /// instruction into `frame`, moves GUEST_RIP past the exiting instruction,
 /// updates the guest's interruptibility state (an STI or MOV SS shadow ended,
 /// blocking by NMI cleared or set again), queues an NMI, an exception or a
@@ -921,7 +834,9 @@ fn prepare_resume(
     read: &ExitRead,
     plan: ResumePlan,
     frame: &mut RegisterFrame,
+    exit: &mut backend::VmExit,
 ) -> Result<(ResumePlan, Resumed), ResumeFailure> {
+    let write = |what| move |error| ResumeFailure::Write { what, error };
     let rip = read.rip.map_err(|_| ResumeFailure::RipUnreadable)?;
     // Checked before the emulation: with the length unreadable or the new RIP
     // wrapping or non-canonical, a WRMSR or OUT would already have happened
@@ -952,7 +867,7 @@ fn prepare_resume(
     } = plan;
 
     let resume_rip = if let Some(next) = advance_to {
-        write_for_resume(GUEST_RIP, next, "advance guest RIP")?;
+        exit.set_rip(next).map_err(write("advance guest RIP"))?;
         next
     } else {
         // An NMI exit: the guest goes on at the instruction it was about to
@@ -967,77 +882,50 @@ fn prepare_resume(
     // IRET (`ResumePlan::interruptibility`). `exit` is always read here:
     // `decide` only plans a resume for an exit it could judge. Written only
     // when something changes, so most exits pay nothing.
-    let found = read.exit.map_or(0, |exit| exit.interruptibility);
+    let found = read.exit.map_or(Interruptibility::NONE, |exit| exit.interruptibility);
     let interruptibility = plan.interruptibility(found);
     if interruptibility != found {
-        write_for_resume(
-            GUEST_INTERRUPTIBILITY_STATE,
-            interruptibility.into(),
-            "update the guest's interruptibility state",
-        )?;
+        exit.set_interruptibility(interruptibility)
+            .map_err(write("update the guest's interruptibility state"))?;
     }
     if inject_nmi {
-        write_for_resume(
-            VM_ENTRY_INTERRUPTION_INFO,
-            InterruptionInfo::NMI.0.into(),
-            "queue the NMI for injection",
-        )?;
+        exit.inject_event(InjectedEvent::NMI)
+            .map_err(write("queue the NMI for injection"))?;
     }
     if let Some(exception) = inject_exception {
-        // SAFETY: exit context: VMX root operation, with the guest's VMCS
-        // current.
-        unsafe { queue_exception(exception) }.map_err(|error| ResumeFailure::Write {
-            what: "queue the exception for injection",
-            error,
-        })?;
+        exit.inject_event(exception)
+            .map_err(write("queue the exception for injection"))?;
     }
     if let Some(redelivery) = redeliver {
-        // SAFETY: exit context: VMX root operation, with the guest's VMCS
-        // current.
-        unsafe { write_redelivery(redelivery) }.map_err(|error| ResumeFailure::Write {
-            what: "queue the interrupted event for re-delivery",
-            error,
-        })?;
+        exit.inject_event(redelivery)
+            .map_err(write("queue the interrupted event for re-delivery"))?;
     }
     if let Some(on) = nmi_window {
-        // SAFETY: exit context: VMX root operation, with the guest's VMCS
-        // current. `configure_controls` checked that the CPU allows
-        // NMI-window exiting.
-        unsafe { vmcs::set_nmi_window_exiting(on) }.map_err(|error| ResumeFailure::Write {
-            what: if on {
-                "turn NMI-window exiting on"
-            } else {
-                "turn NMI-window exiting off"
-            },
-            error,
-        })?;
+        exit.set_nmi_window(on).map_err(write(if on {
+            "turn NMI-window exiting on"
+        } else {
+            "turn NMI-window exiting off"
+        }))?;
     }
     if let Some(on) = interrupt_window {
-        // SAFETY: exit context: VMX root operation, with the guest's VMCS
-        // current. `configure_controls` checked that the CPU allows
-        // interrupt-window exiting.
-        unsafe { vmcs::set_interrupt_window_exiting(on) }.map_err(|error| ResumeFailure::Write {
-            what: if on {
-                "turn interrupt-window exiting on"
-            } else {
-                "turn interrupt-window exiting off"
-            },
-            error,
-        })?;
+        exit.set_interrupt_window(on).map_err(write(if on {
+            "turn interrupt-window exiting on"
+        } else {
+            "turn interrupt-window exiting off"
+        }))?;
     }
-    if let Some(write) = plan.write_cr {
-        // Emulate a MOV to CR0/CR4: the guest reads `requested` back (the new
-        // read shadow), while GUEST_CRn keeps the VMX fixed bits (`real`).
-        let (guest_field, shadow_field) = cr_write_fields(write.cr);
-        write_for_resume(shadow_field, write.requested, "set the control-register read shadow")?;
-        write_for_resume(guest_field, write.real, "write the guest control register")?;
+    if let Some(cr_write) = plan.write_cr {
+        // Emulate a MOV to CR0/CR4: the guest reads `requested` back, while
+        // the real register keeps the fixed bits (`real`).
+        exit.write_cr(cr_write)
+            .map_err(|(what, error)| ResumeFailure::Write { what, error })?;
     }
     let invept = if grant_write {
         let page = read.protected.ok_or(ResumeFailure::NoProtectedPage)?;
-        // SAFETY: exit context: VMX root operation, guest stopped. `page`
-        // came from `ept::protected_page_for`, so `Ept::build` made the
-        // tables, which are never freed.
-        Some(unsafe { page.grant_write() }.map_err(ResumeFailure::GrantWrite)?)
+        // SAFETY: exit context, guest stopped. `page` came from
+        // `NestedPaging::protected_page_for`, so `build` made the tables,
+        // which are never freed.
+        Some(unsafe { backend::NestedPaging::grant_write(page) }.map_err(ResumeFailure::GrantWrite)?)
     } else {
         None
     };
@@ -1051,76 +939,17 @@ fn prepare_resume(
     ))
 }
 
-/// Queues `exception` for the next VM entry, with error code 0 if it
-/// delivers one, through the guest's own IDT at the instruction RIP points
-/// to.
-///
-/// # Safety
-///
-/// VMX root operation with the guest's VMCS current.
-unsafe fn queue_exception(exception: InterruptionInfo) -> Result<(), VmcsError> {
-    // SAFETY: the caller guarantees VMX root operation with a current VMCS.
-    unsafe {
-        if exception.delivers_error_code() {
-            vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, 0)?;
-        }
-        vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, exception.0.into())
-    }
-}
-
-/// Queues the event `redelivery` describes for the next VM entry: its
-/// interruption info, its error code when it carries one, and its
-/// instruction length for a software interrupt or exception. The
-/// interruption-information field is written last, as for an injection.
-///
-/// # Safety
-///
-/// VMX root operation with the guest's VMCS current.
-unsafe fn write_redelivery(redelivery: Redelivery) -> Result<(), VmcsError> {
-    // SAFETY: the caller guarantees VMX root operation with a current VMCS.
-    unsafe {
-        if let Some(error_code) = redelivery.error_code {
-            vmcs::vmwrite(VM_ENTRY_EXCEPTION_ERROR_CODE, error_code.into())?;
-        }
-        if let Some(length) = redelivery.instruction_len {
-            vmcs::vmwrite(VM_ENTRY_INSTRUCTION_LEN, length.into())?;
-        }
-        vmcs::vmwrite(VM_ENTRY_INTERRUPTION_INFO, redelivery.info.0.into())
-    }
-}
-
-/// Called by the entry stub when VMRESUME falls through instead of entering
-/// the guest; `rflags` is RFLAGS right after it, and `frame` the guest's
-/// registers, which the stub pushed again. Prints why, then the same stop
-/// report as an exit that stops the guest, and returns the stop value the
-/// stub hands back to bring-up, or halts for the firmware.
-#[unsafe(no_mangle)]
-extern "efiapi" fn vmresume_failed(rflags: u64, frame: *const RegisterFrame) -> u64 {
-    // The handler put the guest's phase back before VMRESUME; this is exit
-    // context again.
-    crate::output::set_phase(Phase::VmExit);
+/// After the backend's exit path found that resuming the guest failed (and
+/// printed why): the same stop report as an exit that stops the guest, then
+/// a halt for the firmware. `frame` holds the guest's registers.
+pub fn stop_after_failed_resume(frame: &RegisterFrame) {
     let guest = GuestKind::SELECTED;
-    let tag = crate::TAG;
-    match vmcs::resume_failure(rflags) {
-        // SAFETY: a VmFailValid implies VMX operation with a current VMCS,
-        // so the error number is readable.
-        VmcsError::VmFailValid => match unsafe { vmcs::vm_instruction_error() } {
-            Ok(code) => crate::serial_println!(
-                "{tag} VMRESUME failed: {} ({code})",
-                vmcs::vm_instruction_error_name(code),
-            ),
-            Err(error) => crate::serial_println!("{tag} VMRESUME failed: VmFailValid, error unreadable ({error:?})"),
-        },
-        error => crate::serial_println!("{tag} VMRESUME failed: {error:?}"),
-    }
-    crate::serial_println!("{tag} VMRESUME failed; stopping the guest; {}.", after_stop(guest));
-    // SAFETY: the stub passes the frame it just pushed on the exit stack,
-    // which stays put until this returns.
-    let frame = unsafe { &*frame };
-    // The VMRESUME belongs to the last exit, so its number heads the report.
-    report_stop(stats::snapshot().exits, frame, &exits_by_reason());
+    // SAFETY: the resume just failed in exit context: still root mode, with
+    // the guest's vCPU current.
+    let exit = unsafe { backend::VmExit::current() };
+    // The resume belongs to the last exit, so its number heads the report.
+    report_stop(stats::snapshot().exits, frame, &exits_by_reason(), &exit);
     halt_unless_returnable(guest);
-    encode_resume_failed(rflags)
 }
 
 #[cfg(test)]

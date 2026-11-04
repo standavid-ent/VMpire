@@ -10,7 +10,7 @@
 use core::fmt;
 use core::ops::RangeInclusive;
 
-use crate::hal::intel::ept::WalkEnd;
+use crate::hal::types::WalkEnd;
 use crate::x86::mtrr::MemoryType;
 use crate::x86::paging::{Mapping, WalkError};
 
@@ -130,9 +130,9 @@ pub fn check_registers(
         WalkEnd::Mapped {
             hpa,
             memory_type: MemoryType::Uncacheable,
-            access,
+            permissions,
             ..
-        } if hpa == address && access & crate::hal::intel::ept::EPT_READ != 0 => Ok(()),
+        } if hpa == address && permissions.read => Ok(()),
         end => Err(LocalApicError::EptMapping { address, end }),
     }
 }

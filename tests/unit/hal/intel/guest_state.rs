@@ -135,3 +135,15 @@ fn a_segment_prints_as_the_guest_state_line_shows_it() {
         "selector=0x0028 base=0x0000000000000000 limit=0xffffffff access=0x0a09b"
     );
 }
+
+#[test]
+fn descriptors_give_their_vmcs_access_rights() {
+    // The usual flat 64-bit code descriptor: G=1 L=1 | P=1 DPL=0 S=1 type=0xB.
+    assert_eq!(SegmentDescriptor(0x00AF_9B00_0000_FFFF).access_rights(), 0xA09B);
+    // The usual flat data descriptor: G=1 D/B=1 | P=1 DPL=0 S=1 type=0x3.
+    assert_eq!(SegmentDescriptor(0x00CF_9300_0000_FFFF).access_rights(), 0xC093);
+    // Base 0x1234_5678, limit 0x1_2345 with G=0: limit bits 19:16 sit
+    // between the two access-rights halves; they must not leak into
+    // access-rights bits 11:8.
+    assert_eq!(SegmentDescriptor(0x1201_9334_5678_2345).access_rights(), 0x0093);
+}

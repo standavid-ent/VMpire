@@ -1,19 +1,33 @@
-//! Unit tests for `src/vmx/exit_decision/mod.rs`: the shared types, the
+//! Unit tests for `src/hv/exit_decision/mod.rs`: the shared types, the
 //! dispatch, and through `decide` the handlers in `scenario.rs`.
+//!
+//! The exits are written as the Intel backend reads them (VMCS values:
+//! [`RawExit`]) and decoded into `ExitInfo` with the backend's own decoders,
+//! as the exit handler's `read_exit` does, so each test keeps the values a
+//! real exit has.
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its
 //! private items.
 
-use super::scenario::{BLOCKING_BY_MOV_SS, BLOCKING_BY_NMI, BLOCKING_BY_STI};
+use super::raw_exit::*;
 use super::*;
+use crate::hal::intel::vm_exit::decode_fault;
+use crate::hal::intel::vmexit::decode::ExitReason;
+use crate::hal::intel::vmexit::decode::*;
+use crate::hal::types::{CrConstraints, CrNumber};
 use crate::hv::guest::{
     GUEST_DATA_SEED, GUEST_EPT_VALUE, GUEST_IO_VALUE, GUEST_MARKER, GUEST_MSR_VALUE, GUEST_MTRR_BASE, GUEST_NMI_MARKER,
     GUEST_SCRATCH_PORT, GUEST_XCR0_VALUE, expected_stats,
 };
 use crate::hv::vmexit::VcpuStats;
-use crate::x86::cr::{CR0_NE, CR0_PE, CR0_PG, CR4_OSXSAVE, CR4_VMXE, CrFixed};
+use crate::x86::cr::{CR0_NE, CR0_PE, CR0_PG, CR4_OSXSAVE, CR4_VMXE};
 use crate::x86::mtrr::MtrrCapabilities;
+
+/// `decide` on `exit` as the backend reads it.
+fn decide(guest: GuestKind, state: ExitState, exit: RawExit) -> (ExitEvent, ExitState) {
+    super::decide(guest, state, exit.info())
+}
 
 const MARKER: u64 = GUEST_MARKER as u64;
 const NMI_MARKER: u64 = GUEST_NMI_MARKER as u64;
@@ -54,8 +68,8 @@ const PROTECTED_WRITE: u64 = 0x18A;
 /// A page fault: hardware exception (type 3), error code valid, vector 14.
 const PAGE_FAULT_INFO: u32 = 0x8000_0B0E;
 
-fn exit(basic: u16) -> ExitInfo {
-    ExitInfo {
+fn exit(basic: u16) -> RawExit {
+    RawExit {
         reason: ExitReason {
             basic,
             entry_failure: false,
@@ -76,7 +90,7 @@ fn exit(basic: u16) -> ExitInfo {
         hyperv: false,
         guest_cpl: 0,
         cr_source: 0,
-        cr_fixed: CrFixed::NONE,
+        cr_fixed: CrConstraints::NONE,
         guest_cr4: 0,
         xcr0_supported: 0,
     }
@@ -85,18 +99,18 @@ fn exit(basic: u16) -> ExitInfo {
 /// FIXED MSRs of the usual shape: CR0 fixes PE, NE and PG (and the high bits
 /// reserved as 0); CR4 fixes VMXE on, allows the common CR4 bits, forbids the
 /// rest. The reason-28 decision follows from these (`crate::x86::cr`).
-const CR_FIXED: CrFixed = CrFixed {
-    cr0_fixed0: 0x8000_0021,
-    cr0_fixed1: 0xFFFF_FFFF,
-    cr4_fixed0: CR4_VMXE,
-    cr4_fixed1: 0x2_7FFF,
+const CR_FIXED: CrConstraints = CrConstraints {
+    cr0_must_be_one: 0x8000_0021,
+    cr0_may_be_one: 0xFFFF_FFFF,
+    cr4_must_be_one: CR4_VMXE,
+    cr4_may_be_one: 0x2_7FFF,
 };
 
 /// A MOV to CR `cr` loading `source` from register `gpr`: exit qualification
 /// with access type 0 (MOV to CR), the CR number in bits 3:0 and the register
 /// in bits 11:8.
-fn cr_mov(cr: u8, gpr: u8, source: u64) -> ExitInfo {
-    ExitInfo {
+fn cr_mov(cr: u8, gpr: u8, source: u64) -> RawExit {
+    RawExit {
         qualification: u64::from(cr) | (u64::from(gpr) << 8),
         cr_source: source,
         cr_fixed: CR_FIXED,
@@ -105,8 +119,8 @@ fn cr_mov(cr: u8, gpr: u8, source: u64) -> ExitInfo {
 }
 
 /// An EPT violation at `gpa` with exit qualification `qualification`.
-fn ept_violation(gpa: u64, qualification: u64) -> ExitInfo {
-    ExitInfo {
+fn ept_violation(gpa: u64, qualification: u64) -> RawExit {
+    RawExit {
         guest_physical: gpa,
         qualification,
         ..exit(EXIT_REASON_EPT_VIOLATION)
@@ -114,7 +128,7 @@ fn ept_violation(gpa: u64, qualification: u64) -> ExitInfo {
 }
 
 /// The guest's write to its data page, 4 bytes in (any offset counts).
-fn protected_write() -> ExitInfo {
+fn protected_write() -> RawExit {
     ept_violation(PROTECTED_PAGE + 4, PROTECTED_WRITE)
 }
 
@@ -122,8 +136,8 @@ fn protected_write() -> ExitInfo {
 /// CPU pushes the interrupt frame: an EPT write violation on the stack page,
 /// its IDT-vectoring field holding the interrupted NMI (`vectoring`). The
 /// offset mirrors the Hyper-V run's GPA 0x7ff7fff8.
-fn nmi_stack_fault(vectoring: InterruptionInfo) -> ExitInfo {
-    ExitInfo {
+fn nmi_stack_fault(vectoring: InterruptionInfo) -> RawExit {
+    RawExit {
         guest_physical: STACK_PAGE + 0xFF8,
         protected_page: STACK_PAGE,
         idt_vectoring: vectoring,
@@ -132,8 +146,8 @@ fn nmi_stack_fault(vectoring: InterruptionInfo) -> ExitInfo {
     }
 }
 
-fn vmcall(rax: u64) -> ExitInfo {
-    ExitInfo {
+fn vmcall(rax: u64) -> RawExit {
+    RawExit {
         guest_rax: rax,
         ..exit(EXIT_REASON_VMCALL)
     }
@@ -141,16 +155,16 @@ fn vmcall(rax: u64) -> ExitInfo {
 
 /// A VMCALL of the firmware or the OS, with `rcx` in RCX, from CPL 0, under
 /// Hyper-V.
-fn hypercall(rcx: u64) -> ExitInfo {
-    ExitInfo {
+fn hypercall(rcx: u64) -> RawExit {
+    RawExit {
         guest_rcx: rcx,
         hyperv: true,
         ..exit(EXIT_REASON_VMCALL)
     }
 }
 
-fn nmi(interruptibility: u32) -> ExitInfo {
-    ExitInfo {
+fn nmi(interruptibility: u32) -> RawExit {
+    RawExit {
         interruption_info: NMI_INFO,
         interruptibility,
         ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
@@ -159,7 +173,7 @@ fn nmi(interruptibility: u32) -> ExitInfo {
 
 #[test]
 fn injected_nmi_is_valid_type_2_vector_2() {
-    assert_eq!(InterruptionInfo::NMI, InterruptionInfo(0x8000_0202));
+    assert_eq!(entry_info(InjectedEvent::NMI), InterruptionInfo(0x8000_0202));
 }
 
 #[test]
@@ -191,11 +205,11 @@ fn ept_qualification_flags_decode() {
     let write = EptQualification(PROTECTED_WRITE);
     assert!(write.is_write());
     assert!(write.linear_valid());
-    assert!(write.is_protected_write());
+    assert!(decode_fault(PROTECTED_WRITE, 0).is_protected_write());
     let read = EptQualification(EPT_ACCESS_READ | EPT_PAGE_READABLE);
     assert!(!read.is_write());
     assert!(!read.linear_valid());
-    assert!(!read.is_protected_write());
+    assert!(!decode_fault(EPT_ACCESS_READ | EPT_PAGE_READABLE, 0).is_protected_write());
 }
 
 #[test]
@@ -237,7 +251,7 @@ fn a_violation_on_a_device_page_stops_with_the_violation() {
 #[test]
 fn violation_with_nothing_protected_stops_with_the_violation() {
     // Before Ept::build the protected page is 0, and GPA 0 must not match.
-    let unprotected = ExitInfo {
+    let unprotected = RawExit {
         protected_page: 0,
         stack_page: 0,
         ..ept_violation(0, PROTECTED_WRITE)
@@ -299,7 +313,7 @@ fn violation_during_nmi_unblocking_iret_is_granted_and_blocks_nmis_again() {
     let (event, state) = decide(GuestKind::BuiltInTest, START, iret);
     assert_eq!((event, state), (ExitEvent::EptWriteGranted, WRITTEN));
     let plan = match event.action() {
-        ExitAction::Resume(plan) => plan.restoring_nmi_blocking(&iret),
+        ExitAction::Resume(plan) => plan.restoring_nmi_blocking(&iret.info()),
         other => panic!("expected a resume, got {other:?}"),
     };
     assert_eq!(
@@ -309,7 +323,7 @@ fn violation_during_nmi_unblocking_iret_is_granted_and_blocks_nmis_again() {
             ..ResumePlan::RETRY_AFTER_GRANT
         }
     );
-    assert_eq!(plan.interruptibility(0), BLOCKING_BY_NMI);
+    assert_eq!(resume_interruptibility(plan, 0), BLOCKING_BY_NMI);
 }
 
 /// A #GP raised by an IRET that had ended NMI blocking, as
@@ -321,14 +335,14 @@ const IRET_GP_INFO: InterruptionInfo = InterruptionInfo(0x8000_1B0D);
 fn bit_12_of_the_ept_qualification_or_the_interruption_info_marks_a_faulted_iret() {
     let iret_violation = ept_violation(PROTECTED_PAGE, PROTECTED_WRITE | EPT_NMI_UNBLOCKING_IRET);
     assert!(iret_violation.faulted_nmi_unblocking_iret());
-    let iret_gp = ExitInfo {
+    let iret_gp = RawExit {
         interruption_info: IRET_GP_INFO,
         ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
     };
     assert!(iret_gp.faulted_nmi_unblocking_iret());
     // Without bit 12: any other EPT violation or exception.
     assert!(!protected_write().faulted_nmi_unblocking_iret());
-    let page_fault = ExitInfo {
+    let page_fault = RawExit {
         interruption_info: InterruptionInfo(PAGE_FAULT_INFO),
         ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
     };
@@ -338,25 +352,25 @@ fn bit_12_of_the_ept_qualification_or_the_interruption_info_marks_a_faulted_iret
 #[test]
 fn bit_12_is_ignored_where_the_sdm_leaves_it_undefined() {
     // During an event's delivery (IDT-vectoring valid).
-    let during_delivery = ExitInfo {
+    let during_delivery = RawExit {
         idt_vectoring: VECTORING_NMI,
         ..ept_violation(PROTECTED_PAGE, PROTECTED_WRITE | EPT_NMI_UNBLOCKING_IRET)
     };
     assert!(!during_delivery.faulted_nmi_unblocking_iret());
     // For a double fault: valid, bit 12, error code, type 3, vector 8.
-    let double_fault = ExitInfo {
+    let double_fault = RawExit {
         interruption_info: InterruptionInfo(0x8000_1B08),
         ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
     };
     assert!(!double_fault.faulted_nmi_unblocking_iret());
     // For an exit whose qualification has another layout.
-    let io = ExitInfo {
+    let io = RawExit {
         qualification: EPT_NMI_UNBLOCKING_IRET,
         ..exit(EXIT_REASON_IO_INSTRUCTION)
     };
     assert!(!io.faulted_nmi_unblocking_iret());
     // For a failed VM entry.
-    let failed = ExitInfo {
+    let failed = RawExit {
         reason: ExitReason {
             basic: EXIT_REASON_EPT_VIOLATION,
             entry_failure: true,
@@ -367,7 +381,7 @@ fn bit_12_is_ignored_where_the_sdm_leaves_it_undefined() {
 }
 
 /// An EPT violation at `page` during an IRET that ended NMI blocking.
-fn iret_violation_on(page: u64) -> ExitInfo {
+fn iret_violation_on(page: u64) -> RawExit {
     ept_violation(page, PROTECTED_WRITE | EPT_NMI_UNBLOCKING_IRET)
 }
 
@@ -378,9 +392,13 @@ fn only_a_faulted_iret_restores_nmi_blocking() {
         ResumePlan::INJECT_GP,
         ResumePlan::PAST_INSTRUCTION,
     ] {
-        assert!(!plan.restoring_nmi_blocking(&protected_write()).restore_nmi_blocking);
         assert!(
-            plan.restoring_nmi_blocking(&iret_violation_on(PROTECTED_PAGE))
+            !plan
+                .restoring_nmi_blocking(&protected_write().info())
+                .restore_nmi_blocking
+        );
+        assert!(
+            plan.restoring_nmi_blocking(&iret_violation_on(PROTECTED_PAGE).info())
                 .restore_nmi_blocking
         );
     }
@@ -403,7 +421,7 @@ fn violation_on_a_guest_page_table_access_stops_with_the_violation() {
 
 #[test]
 fn ept_misconfiguration_stops_with_its_own_event() {
-    let misconfig = ExitInfo {
+    let misconfig = RawExit {
         guest_physical: PROTECTED_PAGE,
         ..exit(EXIT_REASON_EPT_MISCONFIG)
     };
@@ -438,7 +456,7 @@ fn first_main_vmcall_resumes() {
 
 #[test]
 fn first_main_vmcall_with_a_wrong_seed_is_a_data_page_mismatch() {
-    let wrong_seed = ExitInfo {
+    let wrong_seed = RawExit {
         guest_rcx: 0xDA7B,
         ..vmcall(MARKER)
     };
@@ -451,7 +469,7 @@ fn first_main_vmcall_with_a_wrong_seed_is_a_data_page_mismatch() {
 #[test]
 fn first_main_vmcall_with_a_wrong_value_is_a_data_page_mismatch() {
     // The write never landed: the guest read the seed back.
-    let unwritten = ExitInfo {
+    let unwritten = RawExit {
         guest_rdx: GUEST_DATA_SEED.into(),
         ..vmcall(MARKER)
     };
@@ -463,7 +481,7 @@ fn first_main_vmcall_with_a_wrong_value_is_a_data_page_mismatch() {
 
 #[test]
 fn data_page_values_compare_as_32_bits() {
-    let high_bits = ExitInfo {
+    let high_bits = RawExit {
         guest_rcx: (1 << 32) | u64::from(GUEST_DATA_SEED),
         guest_rdx: (1 << 32) | u64::from(GUEST_EPT_VALUE),
         ..vmcall(MARKER)
@@ -477,7 +495,7 @@ fn data_page_values_compare_as_32_bits() {
 #[test]
 fn second_main_vmcall_does_not_check_the_data_page() {
     // RCX is the wait loop's counter by then.
-    let counting = ExitInfo {
+    let counting = RawExit {
         guest_rcx: 0x1FFF_0000,
         ..vmcall(MARKER + 1)
     };
@@ -607,7 +625,7 @@ fn window_exit_inside_an_sti_shadow_waits_for_the_interrupt_window() {
         nmi_pending: true,
         ..WAITING
     };
-    let in_shadow = ExitInfo {
+    let in_shadow = RawExit {
         interruptibility: BLOCKING_BY_STI,
         ..exit(EXIT_REASON_NMI_WINDOW)
     };
@@ -627,7 +645,7 @@ fn window_exit_while_blocked_by_nmi_keeps_waiting() {
         nmi_pending: true,
         ..WAITING
     };
-    let still_blocked = ExitInfo {
+    let still_blocked = RawExit {
         interruptibility: BLOCKING_BY_NMI,
         ..exit(EXIT_REASON_NMI_WINDOW)
     };
@@ -655,7 +673,7 @@ fn interrupt_window_exit_while_blocked_by_nmi_waits_for_the_nmi_window() {
         nmi_pending: true,
         ..WAITING
     };
-    let blocked = ExitInfo {
+    let blocked = RawExit {
         interruptibility: BLOCKING_BY_NMI,
         ..exit(EXIT_REASON_INTERRUPT_WINDOW)
     };
@@ -793,7 +811,7 @@ fn a_vectoring_exit_is_still_judged_by_its_reason() {
     // Before re-delivery, any valid vectoring field stopped the guest. Now
     // the exit goes to its reason's handler, and the delivery is re-delivered
     // on top of the plan.
-    let interrupted = ExitInfo {
+    let interrupted = RawExit {
         idt_vectoring: VECTORING_NMI,
         ..vmcall(MARKER)
     };
@@ -818,7 +836,7 @@ fn an_ept_violation_during_delivery_grants_write_and_re_delivers() {
         other => panic!("expected a resume, got {other:?}"),
     };
     let redelivery = interrupted.redelivery(None).expect("the NMI is re-delivered");
-    assert_eq!(redelivery.info, VECTORING_NMI);
+    assert_eq!(entry_info(redelivery), VECTORING_NMI);
     assert_eq!(
         plan.redelivering(redelivery),
         Some(ResumePlan {
@@ -889,20 +907,20 @@ fn nmi_vectoring_accepts_type_2_and_type_3_vector_2() {
 fn a_type_3_vector_2_vectoring_re_delivers_as_an_nmi() {
     // Hyper-V reports the interrupted NMI as a hardware exception (type 3);
     // re-delivery must re-arm it as an NMI (type 2), not a #2 exception.
-    let hyperv_nmi = ExitInfo {
+    let hyperv_nmi = RawExit {
         idt_vectoring: InterruptionInfo(0x8000_0302),
         ..vmcall(MARKER)
     };
     let redelivery = hyperv_nmi.redelivery(None).expect("vector 2 is the NMI");
-    assert_eq!(redelivery.info, InterruptionInfo::NMI);
-    assert!(redelivery.info.is_nmi());
+    assert_eq!(redelivery, InjectedEvent::NMI);
+    assert!(redelivery.is_nmi());
 }
 
 #[test]
 fn re_delivering_a_non_nmi_does_not_clear_nmi_blocking() {
     // Only a re-delivered NMI needs blocking by NMI cleared; a page fault
     // leaves it alone.
-    let page_fault = ExitInfo {
+    let page_fault = RawExit {
         idt_vectoring: InterruptionInfo(PAGE_FAULT_INFO),
         ..vmcall(MARKER)
     };
@@ -918,7 +936,7 @@ fn a_hyperv_nmi_stack_fault_is_granted_re_delivered_and_unblocks_nmi() {
     // (idt_vectoring = 0x8000_0302), with blocking by NMI set. Told apart by
     // page, it is still the NMI stack grant; re-delivery re-arms a type-2 NMI
     // and clears NMI blocking so VM entry can inject it.
-    let fault = ExitInfo {
+    let fault = RawExit {
         interruptibility: BLOCKING_BY_NMI,
         ..nmi_stack_fault(InterruptionInfo(0x8000_0302))
     };
@@ -931,7 +949,7 @@ fn a_hyperv_nmi_stack_fault_is_granted_re_delivered_and_unblocks_nmi() {
         other => panic!("expected a resume, got {other:?}"),
     };
     let redelivery = fault.redelivery(None).expect("the NMI is re-delivered");
-    assert_eq!(redelivery.info, InterruptionInfo::NMI);
+    assert_eq!(redelivery, InjectedEvent::NMI);
     let plan = plan.redelivering(redelivery).expect("re-delivered on top of the grant");
     assert!(plan.clear_nmi_blocking, "NMI blocking must be cleared for re-delivery");
     // The handler's helper drops bit 3 of the interruptibility state.
@@ -942,12 +960,12 @@ fn a_hyperv_nmi_stack_fault_is_granted_re_delivered_and_unblocks_nmi() {
 fn redelivery_clears_bits_30_to_12_and_keeps_the_event() {
     // Bit 12 (NMI unblocking due to IRET) is exit-only; it must not reach the
     // VM-entry field.
-    let interrupted = ExitInfo {
+    let interrupted = RawExit {
         idt_vectoring: InterruptionInfo(0x8000_1202),
         ..vmcall(MARKER)
     };
     assert_eq!(
-        interrupted.redelivery(None).unwrap().info,
+        entry_info(interrupted.redelivery(None).unwrap()),
         InterruptionInfo(0x8000_0202)
     );
 }
@@ -955,7 +973,7 @@ fn redelivery_clears_bits_30_to_12_and_keeps_the_event() {
 #[test]
 fn redelivery_keeps_an_exception_error_code() {
     // A hardware exception (type 3) with the error-code bit (#PF, vector 14).
-    let page_fault = ExitInfo {
+    let page_fault = RawExit {
         idt_vectoring: InterruptionInfo(0x8000_0B0E),
         idt_vectoring_error_code: 0x2,
         ..vmcall(MARKER)
@@ -964,7 +982,7 @@ fn redelivery_keeps_an_exception_error_code() {
     assert_eq!(redelivery.error_code, Some(0x2));
     assert_eq!(redelivery.instruction_len, None);
     // An exception without the bit (#UD, vector 6) carries no error code.
-    let invalid_opcode = ExitInfo {
+    let invalid_opcode = RawExit {
         idt_vectoring: InterruptionInfo(0x8000_0306),
         idt_vectoring_error_code: 0x2,
         ..vmcall(MARKER)
@@ -975,7 +993,7 @@ fn redelivery_keeps_an_exception_error_code() {
 #[test]
 fn a_software_interrupt_re_delivers_with_its_length() {
     // A software interrupt (type 4), e.g. INT 0x80.
-    let software = ExitInfo {
+    let software = RawExit {
         idt_vectoring: InterruptionInfo(0x8000_0480),
         ..vmcall(MARKER)
     };
@@ -988,7 +1006,7 @@ fn a_software_interrupt_re_delivers_with_its_length() {
 
 #[test]
 fn redelivery_conflicts_with_an_advance_or_injection() {
-    let redelivery = ExitInfo {
+    let redelivery = RawExit {
         idt_vectoring: VECTORING_NMI,
         ..vmcall(MARKER)
     }
@@ -1003,7 +1021,7 @@ fn redelivery_conflicts_with_an_advance_or_injection() {
 
 #[test]
 fn entry_failure_is_unexpected() {
-    let failed = ExitInfo {
+    let failed = RawExit {
         reason: ExitReason {
             basic: EXIT_REASON_VMCALL,
             entry_failure: true,
@@ -1018,7 +1036,7 @@ fn entry_failure_is_unexpected() {
 
 #[test]
 fn exception_exit_is_unexpected() {
-    let page_fault = ExitInfo {
+    let page_fault = RawExit {
         interruption_info: InterruptionInfo(PAGE_FAULT_INFO),
         ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
     };
@@ -1114,7 +1132,7 @@ fn hlt_resumes_past_the_instruction() {
 fn hlt_in_an_sti_shadow_is_decided_the_same() {
     // `sti; hlt`: the exit reports blocking by STI; the decision does not
     // depend on it, the RIP advance ends it.
-    let in_shadow = ExitInfo {
+    let in_shadow = RawExit {
         interruptibility: BLOCKING_BY_STI,
         ..exit(EXIT_REASON_HLT)
     };
@@ -1125,10 +1143,13 @@ fn hlt_in_an_sti_shadow_is_decided_the_same() {
 fn the_resume_interruptibility_follows_the_plan() {
     let everything = BLOCKING_BY_STI | BLOCKING_BY_MOV_SS | BLOCKING_BY_NMI;
     // Nothing to change.
-    assert_eq!(ResumePlan::RETRY_AFTER_GRANT.interruptibility(everything), everything);
+    assert_eq!(
+        resume_interruptibility(ResumePlan::RETRY_AFTER_GRANT, everything),
+        everything
+    );
     // Advancing RIP ends STI and MOV SS blocking, keeps blocking by NMI.
     assert_eq!(
-        ResumePlan::PAST_INSTRUCTION.interruptibility(everything),
+        resume_interruptibility(ResumePlan::PAST_INSTRUCTION, everything),
         BLOCKING_BY_NMI
     );
     // An NMI re-delivery clears blocking by NMI.
@@ -1136,14 +1157,14 @@ fn the_resume_interruptibility_follows_the_plan() {
         clear_nmi_blocking: true,
         ..ResumePlan::RETRY_AFTER_GRANT
     };
-    assert_eq!(redelivering.interruptibility(BLOCKING_BY_NMI), 0);
+    assert_eq!(resume_interruptibility(redelivering, BLOCKING_BY_NMI), 0);
     // A faulted NMI-unblocking IRET sets it again and keeps the rest.
     let restoring = ResumePlan {
         restore_nmi_blocking: true,
         ..ResumePlan::RETRY_AFTER_GRANT
     };
     assert_eq!(
-        restoring.interruptibility(BLOCKING_BY_STI),
+        resume_interruptibility(restoring, BLOCKING_BY_STI),
         BLOCKING_BY_STI | BLOCKING_BY_NMI
     );
 }
@@ -1170,9 +1191,9 @@ fn mwait_and_monitor_inject_invalid_opcode() {
 #[test]
 fn injected_invalid_opcode_is_a_hardware_exception_without_error_code() {
     // Valid (bit 31), hardware exception (type 3), vector 6, no bit 11.
-    assert_eq!(InterruptionInfo::INVALID_OPCODE, InterruptionInfo(0x8000_0306));
-    assert!(!InterruptionInfo::INVALID_OPCODE.delivers_error_code());
-    assert!(InterruptionInfo::GENERAL_PROTECTION.delivers_error_code());
+    assert_eq!(entry_info(InjectedEvent::INVALID_OPCODE), InterruptionInfo(0x8000_0306));
+    assert!(!entry_info(InjectedEvent::INVALID_OPCODE).delivers_error_code());
+    assert!(entry_info(InjectedEvent::GENERAL_PROTECTION).delivers_error_code());
 }
 
 #[test]
@@ -1255,27 +1276,27 @@ fn ept_page_permissions_come_from_bits_5_to_3() {
 }
 
 /// The exits the guest's emulation block causes, in order.
-fn emulated_exits() -> Vec<ExitInfo> {
-    let msr = |basic, rax: u64, rdx: u64| ExitInfo {
+fn emulated_exits() -> Vec<RawExit> {
+    let msr = |basic, rax: u64, rdx: u64| RawExit {
         guest_rax: rax,
         guest_rcx: 0xC000_0102,
         guest_rdx: rdx,
         ..exit(basic)
     };
-    let io = |is_in: bool, rax: u64| ExitInfo {
+    let io = |is_in: bool, rax: u64| RawExit {
         qualification: (u64::from(GUEST_SCRATCH_PORT) << 16) | (u64::from(is_in) << 3),
         guest_rax: rax,
         ..exit(EXIT_REASON_IO_INSTRUCTION)
     };
     // Hyper-V's MTRRs: fixed ranges, eight variable ranges, MAXPHYADDR 46.
-    let mtrr = |basic, msr: u32, value: u64| ExitInfo {
+    let mtrr = |basic, msr: u32, value: u64| RawExit {
         guest_rax: value & 0xFFFF_FFFF,
         guest_rcx: msr.into(),
         guest_rdx: value >> 32,
         mtrr: MtrrCapabilities::new((1 << 8) | 8, 46).unwrap(),
         ..exit(basic)
     };
-    let xsetbv = |value: u64| ExitInfo {
+    let xsetbv = |value: u64| RawExit {
         guest_rax: value,
         guest_rcx: 0,
         guest_rdx: 0,
@@ -1283,7 +1304,7 @@ fn emulated_exits() -> Vec<ExitInfo> {
         ..exit(EXIT_REASON_XSETBV)
     };
     vec![
-        ExitInfo {
+        RawExit {
             guest_rax: 1,
             guest_rcx: 0,
             ..exit(EXIT_REASON_CPUID)
@@ -1297,7 +1318,7 @@ fn emulated_exits() -> Vec<ExitInfo> {
         io(true, 0),
         io(false, 0),
         // CR4.OSXSAVE on, then XCR0 written and put back.
-        ExitInfo {
+        RawExit {
             guest_rax: 1,
             guest_rcx: 0,
             guest_cr4: CR4_OSXSAVE,
@@ -1305,7 +1326,7 @@ fn emulated_exits() -> Vec<ExitInfo> {
         },
         xsetbv(GUEST_XCR0_VALUE.into()),
         xsetbv(0x1),
-        ExitInfo {
+        RawExit {
             guest_rax: 0x8000_0008,
             ..exit(EXIT_REASON_CPUID)
         },
@@ -1328,7 +1349,7 @@ fn emulated_exits() -> Vec<ExitInfo> {
 
 #[test]
 fn cpuid_exit_is_dispatched_to_emulation() {
-    let cpuid = ExitInfo {
+    let cpuid = RawExit {
         guest_rax: 1,
         guest_rcx: 0,
         ..exit(EXIT_REASON_CPUID)
@@ -1345,7 +1366,7 @@ fn cpuid_exit_is_dispatched_to_emulation() {
 
 #[test]
 fn xsetbv_exit_is_dispatched_to_emulation_for_any_guest() {
-    let xsetbv = ExitInfo {
+    let xsetbv = RawExit {
         guest_rax: 0x3,
         guest_rcx: 0,
         guest_rdx: 0,
@@ -1386,14 +1407,17 @@ fn whole_guest_run_finishes_with_the_expected_stats() {
 fn injected_general_protection_is_a_hardware_exception_with_error_code() {
     // Valid (bit 31), error code (bit 11), hardware exception (type 3),
     // vector 13.
-    assert_eq!(InterruptionInfo::GENERAL_PROTECTION, InterruptionInfo(0x8000_0B0D));
+    assert_eq!(
+        entry_info(InjectedEvent::GENERAL_PROTECTION),
+        InterruptionInfo(0x8000_0B0D)
+    );
 }
 
 #[test]
 fn msr_exits_are_dispatched_to_emulation() {
     // RDX = 0: `exit` defaults it to GUEST_EPT_VALUE, which as the upper half
     // of a WRMSR value would be non-canonical.
-    let msr = |basic| ExitInfo {
+    let msr = |basic| RawExit {
         guest_rcx: 0xC000_0102,
         guest_rdx: 0,
         ..exit(basic)
@@ -1410,7 +1434,7 @@ fn msr_exits_are_dispatched_to_emulation() {
 
 #[test]
 fn io_exit_is_dispatched_to_emulation() {
-    let byte_in = ExitInfo {
+    let byte_in = RawExit {
         qualification: (0x3FF << 16) | (1 << 3),
         ..exit(EXIT_REASON_IO_INSTRUCTION)
     };
@@ -1497,7 +1521,7 @@ fn an_nmi_in_root_operation_at_vmcall_1_reaches_the_guest() {
 }
 
 /// What `decide` makes of `exit` for the firmware, from `state`.
-fn firmware(state: ExitState, exit: ExitInfo) -> ExitAction {
+fn firmware(state: ExitState, exit: RawExit) -> ExitAction {
     decide(GuestKind::Firmware, state, exit).0.action()
 }
 
@@ -1505,11 +1529,11 @@ fn firmware(state: ExitState, exit: ExitInfo) -> ExitAction {
 fn the_firmware_resumes_from_every_exit_aleph0_handles() {
     // Hyper-V's first synthetic MSR, outside the MSR bitmap: #GP without
     // Hyper-V's interface, forwarded with it, and on either way.
-    let synthetic_msr = ExitInfo {
+    let synthetic_msr = RawExit {
         guest_rcx: 0x4000_0000,
         ..exit(EXIT_REASON_RDMSR)
     };
-    let forwarded_msr = ExitInfo {
+    let forwarded_msr = RawExit {
         hyperv: true,
         ..synthetic_msr
     };
@@ -1563,7 +1587,7 @@ fn the_firmware_resumes_past_aleph0s_own_vmcalls() {
     ] {
         // Under Hyper-V or not: they are Aleph0's either way.
         for hyperv in [false, true] {
-            let exit = ExitInfo {
+            let exit = RawExit {
                 hyperv,
                 ..hypercall(rcx)
             };
@@ -1605,7 +1629,7 @@ fn every_other_firmware_vmcall_is_forwarded_under_hyper_v() {
         );
     }
     // Aleph0's values in RAX are no call to Aleph0 any more.
-    let in_rax = ExitInfo {
+    let in_rax = RawExit {
         guest_rax: vmcall::BOOT_SERVICES_ENDED,
         ..hypercall(0x5C)
     };
@@ -1636,9 +1660,9 @@ fn a_refused_forward_injects_at_the_instruction_and_keeps_the_rest() {
         nmi_pending: true,
         ..START
     });
-    let refused = plan.refused_with(InterruptionInfo::INVALID_OPCODE);
+    let refused = plan.refused_with(InjectedEvent::INVALID_OPCODE);
     assert!(!refused.advance_rip);
-    assert_eq!(refused.inject_exception, Some(InterruptionInfo::INVALID_OPCODE));
+    assert_eq!(refused.inject_exception, Some(InjectedEvent::INVALID_OPCODE));
     assert_eq!(
         (refused.nmi_window, refused.emulate),
         (Some(true), Some(Emulation::Hypercall { input: 0x5C }))
@@ -1649,7 +1673,7 @@ fn a_refused_forward_injects_at_the_instruction_and_keeps_the_rest() {
 fn a_vmcall_without_hyper_v_gets_invalid_opcode() {
     // As on hardware without a hypervisor: VMCALL outside VMX non-root
     // operation is #UD.
-    let exit = ExitInfo {
+    let exit = RawExit {
         hyperv: false,
         ..hypercall(0x5C)
     };
@@ -1667,7 +1691,7 @@ fn a_vmcall_from_cpl_3_gets_invalid_opcode_whatever_rcx_holds() {
     // too.
     for cpl in 1..=3 {
         for rcx in [0x5C, vmcall::BOOT_SERVICES_ENDED, vmcall::TEST] {
-            let exit = ExitInfo {
+            let exit = RawExit {
                 guest_cpl: cpl,
                 ..hypercall(rcx)
             };
@@ -1699,7 +1723,7 @@ fn the_test_guest_keeps_its_script_under_hyper_v() {
             "rcx={rcx:#x}"
         );
     }
-    let marked = |rax| ExitInfo {
+    let marked = |rax| RawExit {
         hyperv: true,
         ..vmcall(rax)
     };
@@ -1719,11 +1743,11 @@ fn the_test_guest_keeps_its_script_under_hyper_v() {
 
 #[test]
 fn the_firmware_stops_at_an_unhandled_exit() {
-    let page_fault = ExitInfo {
+    let page_fault = RawExit {
         interruption_info: InterruptionInfo(PAGE_FAULT_INFO),
         ..exit(EXIT_REASON_EXCEPTION_OR_NMI)
     };
-    let entry_failure = ExitInfo {
+    let entry_failure = RawExit {
         reason: ExitReason {
             basic: 33,
             entry_failure: true,
@@ -1805,7 +1829,7 @@ fn a_mov_from_cr_clts_or_lmsw_stops() {
     // Aleph0's masks own no bit these can change, so they should not exit; if
     // one does, stop. Access type is bits 5:4 of the qualification.
     for access in [1u64, 2, 3] {
-        let exit = ExitInfo {
+        let exit = RawExit {
             qualification: access << 4,
             cr_fixed: CR_FIXED,
             ..exit(EXIT_REASON_CONTROL_REGISTER)
@@ -1858,7 +1882,7 @@ fn the_firmware_never_finishes() {
     for state in [START, WRITTEN, WAITING] {
         for basic in 0..=u16::from(u8::MAX) {
             for rax in [0, MARKER, MARKER + 1, NMI_MARKER] {
-                let exit = ExitInfo {
+                let exit = RawExit {
                     guest_rax: rax,
                     ..exit(basic)
                 };

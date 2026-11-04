@@ -38,7 +38,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::idt::{exception_name, has_error_code};
-use crate::hal::intel::vmcs;
+use crate::hal::{VmExit as _, backend};
 use crate::hv::exit_decision::NMI_VECTOR;
 use crate::hv::hyperv;
 use crate::x86::cr::read_cr2;
@@ -208,11 +208,11 @@ extern "efiapi" fn host_nmi_handler() {
     NMIS_TAKEN.fetch_add(1, Ordering::Relaxed);
     NMI_PENDING.store(true, Ordering::Release);
     // SAFETY: this IDT is live only between a VM exit and teardown, so the
-    // CPU is in VMX root operation with the guest's VMCS current. Bring-up
-    // checked that the CPU allows NMI-window exiting. A failure leaves the
-    // NMI pending; the exit handler turns the window on again before it
+    // CPU is in root mode with the guest's vCPU current: exit context.
+    // Bring-up checked that the CPU allows the NMI window. A failure leaves
+    // the NMI pending; the exit handler turns the window on again before it
     // resumes the guest.
-    let _ = unsafe { vmcs::set_nmi_window_exiting(true) };
+    let _ = unsafe { backend::VmExit::current() }.set_nmi_window(true);
 }
 
 /// Whether an NMI arrived in root operation since the last

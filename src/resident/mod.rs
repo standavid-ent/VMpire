@@ -18,7 +18,6 @@
 pub mod memory;
 pub mod pe;
 
-use core::arch::asm;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
@@ -26,6 +25,7 @@ use uefi::boot::{self, EventType, MemoryType, Tpl};
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::{Event, Status};
 
+use crate::hal::{Hypercall as _, backend};
 use crate::hv::vmcall;
 use crate::x86::page::{self, PAGE_SIZE, RESIDENT_CODE};
 use pe::{Headers, PeError};
@@ -182,13 +182,7 @@ unsafe extern "efiapi" fn on_exit_boot_services(_event: Event, _context: Option<
     // guest (bring-up closes it when the launch fails), so the VMCALL exits
     // to Aleph0, which changes no guest register for it and resumes past
     // it. It touches no memory and no stack.
-    unsafe {
-        asm!(
-            "vmcall",
-            inout("rcx") vmcall::BOOT_SERVICES_ENDED => _,
-            options(nomem, nostack),
-        );
-    }
+    unsafe { backend::Hypercall::call(vmcall::BOOT_SERVICES_ENDED) };
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 //! region and each VMCS. Both start with the VMCS revision identifier from
 //! IA32_VMX_BASIC and are otherwise left to the CPU.
 
-use crate::x86::msr;
+use crate::hal::intel::msr;
 use crate::x86::page::allocate_zeroed_page;
 
 /// IA32_VMX_BASIC bits 30:0: the revision identifier both regions start with.

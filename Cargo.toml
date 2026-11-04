@@ -16,9 +16,13 @@ members = ["crates/uart", "tools/ebs-harness", "tools/os-loader"]
 uart = { path = "crates/uart" }
 uefi = "0.40"
 
-# Switches for the Hyper-V runner (`-Features`, `-TestGuest`); all are off by
-# default. A default build virtualizes the running firmware in place.
+# Switches for the Hyper-V runner (`-Features`, `-TestGuest`); all but the
+# backend are off by default. A default build virtualizes the running
+# firmware in place.
 [features]
+# The hardware backend (HAL_PLAN.md): only the selected one is built.
+default = ["intel"]
+intel = []
 # Run the built-in test guest instead: the regression mode, with its scripted
 # VMCALLs, teardown and the return to firmware outside VMX operation.
 test-guest = []

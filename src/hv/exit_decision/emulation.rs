@@ -2,7 +2,7 @@
 //!
 //! Some guest instructions always exit (CPUID, XSETBV). Others exit because the
 //! exit bitmaps ask for it (RDMSR/WRMSR through the MSR bitmap, IN/OUT through
-//! the I/O bitmaps, both in `crate::hal::intel::exit_bitmaps`). A handler here decides
+//! the I/O bitmaps: `hal::Intercepts`). A handler here decides
 //! what to execute. `vmexit::handler` then runs the real
 //! instruction in root operation, writes the result into the guest's
 //! registers and moves RIP past the instruction, so the guest sees what the
@@ -31,9 +31,11 @@
 use core::arch::x86_64::CpuidResult;
 
 use super::{ExitEvent, ExitInfo};
-use crate::hal::intel::exit_bitmaps::{INTERCEPTED_MSRS, MsrAccess, msr_bit};
+use crate::hal::types::{CpuidRegister, IoSize};
+use crate::hal::{HardwareVirtualization as _, Intercepts as _, backend};
 use crate::hv::features::{CPUID_1_ECX_OSXSAVE, GuestFeatures};
 use crate::hv::hyperv;
+use crate::hv::intercepted::INTERCEPTED_MSRS;
 use crate::x86::cr::{CR4_OSXSAVE, CR4_PKE};
 use crate::x86::mtrr::{self, MtrrCapabilities, MtrrMsr};
 
@@ -72,8 +74,6 @@ pub enum Emulation {
     SyntheticWrite { msr: u32, value: u64 },
 }
 
-/// CPUID.1:ECX bit 5: VMX.
-const CPUID_1_ECX_VMX: u32 = 1 << 5;
 /// CPUID.(EAX=7,ECX=0):ECX bit 4: OSPKE, a copy of CR4.PKE.
 const CPUID_7_ECX_OSPKE: u32 = 1 << 4;
 
@@ -86,8 +86,10 @@ fn mirrors(cr4: u64, cr4_bit: u64, bit: u32) -> u32 {
 /// returned in root operation (`raw`), the guest's CR4 (`guest_cr4`) and what
 /// bring-up offers it (`features`):
 ///
-/// - CPUID.1:ECX.VMX is cleared. A guest that saw it would try VMXON, which
-///   always exits (reason 27), and Aleph0 does not emulate VMX.
+/// - The backend's own CPUID bit is cleared
+///   (`HardwareVirtualization::CPUID_FEATURE`, CPUID.1:ECX.VMX on Intel). A
+///   guest that saw it would try to enter root mode itself, and Aleph0 does
+///   not emulate the extension.
 /// - CPUID.1:ECX.OSXSAVE and CPUID.(7,0):ECX.OSPKE copy the guest's
 ///   CR4.OSXSAVE and CR4.PKE. CPUID runs in root operation, where they copy
 ///   HOST_CR4, not the guest's.
@@ -102,9 +104,9 @@ fn mirrors(cr4: u64, cr4_bit: u64, bit: u32) -> u32 {
 ///   XCR0, and only the guest's XSETBV changes it, so they are the guest's.
 pub fn cpuid_policy(leaf: u32, subleaf: u32, raw: CpuidResult, guest_cr4: u64, features: GuestFeatures) -> CpuidResult {
     let hidden = features.hidden();
-    match (leaf, subleaf) {
+    let result = match (leaf, subleaf) {
         (1, _) => CpuidResult {
-            ecx: (raw.ecx & !(CPUID_1_ECX_VMX | CPUID_1_ECX_OSXSAVE | hidden.leaf_1_ecx))
+            ecx: (raw.ecx & !(CPUID_1_ECX_OSXSAVE | hidden.leaf_1_ecx))
                 | mirrors(guest_cr4, CR4_OSXSAVE, CPUID_1_ECX_OSXSAVE),
             ..raw
         },
@@ -122,10 +124,28 @@ pub fn cpuid_policy(leaf: u32, subleaf: u32, raw: CpuidResult, guest_cr4: u64, f
             ..raw
         },
         _ => raw,
-    }
+    };
+    hide_virtualization(leaf, result)
 }
 
-/// CPUID (exit reason 10), which always exits: execute it with the guest's
+/// `result` of CPUID `leaf` with the backend's own feature bit cleared.
+fn hide_virtualization(leaf: u32, result: CpuidResult) -> CpuidResult {
+    let feature = backend::HardwareVirtualization::CPUID_FEATURE;
+    if leaf != feature.leaf {
+        return result;
+    }
+    let mut result = result;
+    let register = match feature.register {
+        CpuidRegister::Eax => &mut result.eax,
+        CpuidRegister::Ebx => &mut result.ebx,
+        CpuidRegister::Ecx => &mut result.ecx,
+        CpuidRegister::Edx => &mut result.edx,
+    };
+    *register &= !feature.mask;
+    result
+}
+
+/// CPUID ([`ExitReason::Cpuid`](super::ExitReason::Cpuid)), which always exits: execute it with the guest's
 /// EAX (leaf) and ECX (subleaf), for its CR4.
 pub(super) fn cpuid(exit: &ExitInfo) -> ExitEvent {
     ExitEvent::Emulated(Emulation::Cpuid {
@@ -167,7 +187,7 @@ pub fn xcr0_valid(value: u64, supported: u64) -> bool {
         && all_or_none(XCR0_AMX)
 }
 
-/// XSETBV (exit reason 55), which always exits: of EDX:EAX to the XCR in
+/// XSETBV (`ExitReason::Xsetbv`), which always exits: of EDX:EAX to the XCR in
 /// ECX, executed in root operation when it is XCR0 and a value XCR0 takes,
 /// #GP(0) otherwise. The CPU raises #UD (guest CR4.OSXSAVE clear) and #GP
 /// (CPL > 0) before the exit, so only the value is checked here (Intel SDM
@@ -183,11 +203,11 @@ pub(super) fn xsetbv(exit: &ExitInfo) -> ExitEvent {
     }
 }
 
-/// HLT (exit reason 12): resume past it without halting. A halted vCPU
+/// HLT (`ExitReason::Hlt`): resume past it without halting. A halted vCPU
 /// waits for an interrupt, and the guest's interrupts are delivered when it
 /// next runs anyway, so going on at once is a correct, if busy, wait. The
 /// HLT activity state would avoid one exit per idle loop round, but needs
-/// IA32_VMX_MISC bit 6 and a rule for NMI exits taken in that state.
+/// backend support and a rule for NMI exits taken in that state.
 pub(super) fn hlt() -> ExitEvent {
     ExitEvent::Halted
 }
@@ -226,7 +246,7 @@ enum MsrRoute {
 /// Which [`MsrRoute`] `msr` takes, for a guest whose MTRR MSRs are `mtrr`,
 /// with Hyper-V's interface (`hyperv`) or without.
 fn route(msr: u32, mtrr: MtrrCapabilities, hyperv: bool) -> MsrRoute {
-    if msr_bit(msr, MsrAccess::Read).is_none() {
+    if !backend::Intercepts::covers_msr(msr) {
         if hyperv && hyperv::SYNTHETIC_MSRS.contains(&msr) {
             MsrRoute::Synthetic
         } else {
@@ -243,7 +263,7 @@ fn route(msr: u32, mtrr: MtrrCapabilities, hyperv: bool) -> MsrRoute {
     }
 }
 
-/// RDMSR (exit reason 31) of the MSR in ECX.
+/// RDMSR (`ExitReason::Rdmsr`) of the MSR in ECX.
 pub(super) fn rdmsr(exit: &ExitInfo) -> ExitEvent {
     let msr = exit.guest_rcx as u32;
     match route(msr, exit.mtrr, exit.hyperv) {
@@ -261,7 +281,7 @@ pub fn wrmsr_value(exit: &ExitInfo) -> u64 {
     (exit.guest_rdx << 32) | (exit.guest_rax & 0xFFFF_FFFF)
 }
 
-/// WRMSR (exit reason 32) of EDX:EAX to the MSR in ECX.
+/// WRMSR (`ExitReason::Wrmsr`) of EDX:EAX to the MSR in ECX.
 pub(super) fn wrmsr(exit: &ExitInfo) -> ExitEvent {
     let msr = exit.guest_rcx as u32;
     let value = wrmsr_value(exit);
@@ -283,80 +303,6 @@ pub(super) fn wrmsr(exit: &ExitInfo) -> ExitEvent {
     }
 }
 
-/// How many bytes an IN or OUT moves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoSize {
-    Byte,
-    Word,
-    Dword,
-}
-
-impl IoSize {
-    /// Bytes moved: 1, 2 or 4.
-    pub fn bytes(self) -> u8 {
-        match self {
-            Self::Byte => 1,
-            Self::Word => 2,
-            Self::Dword => 4,
-        }
-    }
-
-    /// The bits of RAX the access uses: AL, AX or EAX.
-    fn mask(self) -> u64 {
-        match self {
-            Self::Byte => 0xFF,
-            Self::Word => 0xFFFF,
-            Self::Dword => 0xFFFF_FFFF,
-        }
-    }
-}
-
-/// An I/O instruction's exit qualification (Intel SDM Vol. 3C, "Exit
-/// Qualification for I/O Instructions"):
-///
-/// ```text
-/// bits 2:0   size − 1: 0 = 1 byte, 1 = 2 bytes, 3 = 4 bytes
-/// bit  3     direction: 1 = IN, 0 = OUT
-/// bit  4     string instruction (INS/OUTS)
-/// bit  5     REP prefix
-/// bit  6     operand: 1 = immediate port, 0 = DX
-/// bits 31:16 port
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IoQualification(pub u64);
-
-impl IoQualification {
-    /// The access size, or `None` for the encodings the SDM leaves unused.
-    pub fn size(self) -> Option<IoSize> {
-        match self.0 & 0b111 {
-            0 => Some(IoSize::Byte),
-            1 => Some(IoSize::Word),
-            3 => Some(IoSize::Dword),
-            _ => None,
-        }
-    }
-
-    /// Whether it is IN (bit 3); OUT otherwise.
-    pub fn is_in(self) -> bool {
-        self.0 & (1 << 3) != 0
-    }
-
-    /// Whether it is INS or OUTS (bit 4).
-    pub fn is_string(self) -> bool {
-        self.0 & (1 << 4) != 0
-    }
-
-    /// Whether it has a REP prefix (bit 5).
-    pub fn is_rep(self) -> bool {
-        self.0 & (1 << 5) != 0
-    }
-
-    /// The port (bits 31:16).
-    pub fn port(self) -> u16 {
-        (self.0 >> 16) as u16
-    }
-}
-
 /// RAX after an IN of `size` that read `value`. A 1- or 2-byte IN writes
 /// only AL or AX and keeps the rest of RAX. A 4-byte IN writes EAX, which
 /// zero-extends into RAX like every 32-bit register write in 64-bit mode.
@@ -372,22 +318,25 @@ pub fn out_value(rax: u64, size: IoSize) -> u32 {
     (rax & size.mask()) as u32
 }
 
-/// IN or OUT (exit reason 30), for a port the I/O bitmaps intercept: passed
-/// through with the port and size from the exit qualification. Not checked
+/// IN or OUT (`ExitReason::IoInstruction`), for a port the intercepts
+/// catch: passed through with the port and size the backend read
+/// (`ExitInfo::io_access`). Not checked
 /// against INTERCEPTED_PORTS: an access to several ports exits if any of
 /// them is intercepted (`in ax, dx` at 0x3FE covers 0x3FF), and passing
 /// that access through is what the guest would have done anyway. String
 /// and REP forms, which read or write guest memory, stop the guest.
 pub(super) fn io(exit: &ExitInfo) -> ExitEvent {
-    let io = IoQualification(exit.qualification);
-    let Some(size) = io.size() else {
+    let Some(io) = exit.io_access else {
         return ExitEvent::Unexpected;
     };
-    if io.is_string() || io.is_rep() {
+    let Some(size) = io.size else {
+        return ExitEvent::Unexpected;
+    };
+    if io.is_string || io.is_rep {
         return ExitEvent::Unexpected;
     }
-    let port = io.port();
-    if io.is_in() {
+    let port = io.port;
+    if io.is_in {
         ExitEvent::Emulated(Emulation::In { port, size })
     } else {
         let value = out_value(exit.guest_rax, size);

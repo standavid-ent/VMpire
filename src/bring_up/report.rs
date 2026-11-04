@@ -6,18 +6,14 @@
 use uefi::boot::MemoryType;
 
 use super::PassthroughState;
-use crate::hal::intel::ept::{Ept, EptSupport, Hidden, TypeTables, WalkEnd};
-use crate::hal::intel::exit_bitmaps::{ExitBitmaps, intercepted};
-use crate::hal::intel::guest_state::{GuestEntry, GuestState};
-use crate::hal::intel::vmcs::GuestKind;
+use crate::hal::types::WalkEnd;
+use crate::hal::{HardwareVirtualization, backend};
 use crate::host::{HostEnvironment, InterruptStack};
 use crate::hv::features::{GuestFeatures, HiddenCpuid};
 use crate::hv::guest::{GuestMappings, GuestMemory};
 use crate::hv::hyperv::{Detection, INTERFACE_LEAF, SYNTHETIC_MSRS, VENDOR_LEAF};
 use crate::x86::apic::{ApicBase, LAPIC_VERSION};
-use crate::x86::cr::CrControls;
-use crate::x86::msr::VmcsControlMsrs;
-use crate::x86::mtrr::{MtrrCapabilities, MtrrError, MtrrRegisters, Mtrrs};
+use crate::x86::mtrr::{MtrrError, MtrrRegisters, Mtrrs};
 use crate::x86::page::Allocation;
 
 /// Prints the segmentation state of the context tables, which the guest
@@ -61,39 +57,17 @@ pub(super) fn segment_state() {
     }
 }
 
-/// Prints the CR0/CR4 guest/host masks and initial read shadows: which bits
-/// the guest owns, and the view it gets of them (CR4.VMXE hidden).
-pub(super) fn cr_controls(controls: &CrControls) {
-    log!(
-        "CR shadowing: CR0 mask={:#x} shadow={:#x}; CR4 mask={:#x} shadow={:#x} (VMXE hidden from the guest).",
-        controls.cr0_mask,
-        controls.cr0_shadow,
-        controls.cr4_mask,
-        controls.cr4_shadow,
-    );
-}
-
-/// Prints what the guest is offered beyond the minimal controls: the
-/// secondary controls requested, the CPUID bits hidden for what is not, the
-/// XCR0 bits its XSETBV may set, and HOST_CR4 (`host_cr4`), which has
-/// OSXSAVE whenever Aleph0 runs XSETBV.
-pub(super) fn guest_features(features: GuestFeatures, host_cr4: u64) {
+/// Prints the CPUID bits hidden from the guest for what it is not offered
+/// (the backend prints what it is offered:
+/// `HardwareVirtualization::report_guest_features`).
+pub(super) fn guest_features(features: GuestFeatures) {
     let hidden = features.hidden();
-    log!(
-        "Guest features: secondary controls {:#010x}; XCR0 supported {:#x} (XSETBV {}); HOST_CR4 {host_cr4:#x}.",
-        features.secondary,
-        features.xcr0,
-        if features.xsetbv() {
-            "run in root operation"
-        } else {
-            "gets #GP"
-        },
-    );
+    let vmx = <backend::HardwareVirtualization as HardwareVirtualization>::NAME;
     if hidden == HiddenCpuid::NONE {
-        log!("CPUID bits hidden from the guest: none (besides VMX).");
+        log!("CPUID bits hidden from the guest: none (besides {vmx}).");
     } else {
         log!(
-            "CPUID bits hidden from the guest: 1:ECX={:#x} (7,0):EBX={:#x} (7,0):ECX={:#x} (0xD,1):EAX={:#x} 0x80000001:EDX={:#x} (besides VMX).",
+            "CPUID bits hidden from the guest: 1:ECX={:#x} (7,0):EBX={:#x} (7,0):ECX={:#x} (0xD,1):EAX={:#x} 0x80000001:EDX={:#x} (besides {vmx}).",
             hidden.leaf_1_ecx,
             hidden.leaf_7_ebx,
             hidden.leaf_7_ecx,
@@ -101,35 +75,6 @@ pub(super) fn guest_features(features: GuestFeatures, host_cr4: u64) {
             hidden.extended_edx,
         );
     }
-}
-
-/// Prints the VMX capability MSRs: IA32_VMX_BASIC; for each of the four
-/// control fields and the secondary controls, which bits must be 1 (low
-/// half) and may be 1 (high half); and IA32_VMX_EPT_VPID_CAP.
-pub(super) fn vmx_capabilities(controls: &VmcsControlMsrs) {
-    log!(
-        "VMX BASIC={:#018x}; true controls={}",
-        controls.basic,
-        controls.basic & crate::x86::msr::VMX_BASIC_TRUE_CONTROLS != 0,
-    );
-    for (name, capability) in [
-        ("pin", controls.pinbased),
-        ("primary", controls.primary),
-        ("exit", controls.exit),
-        ("entry", controls.entry),
-    ] {
-        log!(
-            "VMX {name}: required={:#010x} allowed={:#010x}",
-            capability.required(),
-            capability.allowed(),
-        );
-    }
-    log!(
-        "VMX secondary: required={:#010x} allowed={:#010x}; EPT/VPID capabilities={:#018x}",
-        controls.secondary.required(),
-        controls.secondary.allowed(),
-        controls.ept_vpid_cap,
-    );
 }
 
 /// Prints the MTRRs [`crate::x86::mtrr::read`] decoded: whether they are on, the
@@ -147,51 +92,6 @@ pub(super) fn mtrrs(mtrrs: &Mtrrs) {
         for run in mtrrs.runs(crate::x86::mtrr::FIXED_END, crate::x86::page::PAGE_SIZE as u64) {
             log!("MTRR fixed {:#07x}..{:#07x}: {}", run.start, run.end, run.type_name());
         }
-    }
-}
-
-/// Prints what the CPU's EPT offers: what Aleph0 requires of it, and what
-/// the map may use.
-pub(super) fn ept_support(support: EptSupport) {
-    log!(
-        "EPT supported: 4-level walk, WB, 2 MiB pages, INVEPT {}; 1 GiB pages={}; MAXPHYADDR {} bits.",
-        support.invept.name(),
-        support.rules.huge_pages,
-        support.rules.physical_address_bits,
-    );
-}
-
-/// Prints the EPT identity map [`Ept::build`] made, and how its entries
-/// (`types`) map each run of it: read back from the entries, so the lines
-/// show what the CPU walks.
-pub(super) fn ept(ept: &Ept, types: &TypeTables, protected_pages: &[u64]) {
-    let layout = ept.layout();
-    log!(
-        "EPT built: identity 0x0..{:#x} ({} GiB), {} table pages: {} PDPT(s); {} PD(s), for 0x0..{:#x}, with {} PTs for 2 MiB regions mapped in 4 KiB pages and {} spare PTs for the guest's MTRR writes; {} GiB above as 1 GiB pages; {} pages read-only (R=1 W=0 X=0).",
-        ept.end(),
-        ept.end() >> 30,
-        ept.table_pages(),
-        layout.pdpts(),
-        layout.pd_gibs(),
-        layout.pd_end(),
-        ept.split_regions(),
-        ept.spare_pts(),
-        layout.huge_gibs(),
-        protected_pages.len(),
-    );
-    for page in protected_pages {
-        log!("EPT read-only page: {page:#018x}.");
-    }
-    let ram = types.ram().ranges();
-    log!(
-        "EPT memory types: the MTRRs' for the {} RAM range(s) of the UEFI memory map, UC for everything else (MMIO, reserved memory, holes).",
-        ram.len()
-    );
-    for &(start, end) in ram {
-        log!("EPT RAM {start:#014x}..{end:#014x}");
-    }
-    for run in types.region_runs(0, ept.end()) {
-        log!("EPT {:#014x}..{:#014x}: {}", run.start, run.end, run.mapping);
     }
 }
 
@@ -251,17 +151,6 @@ pub(super) fn resident_allocation(allocation: Allocation, memory_type: Option<Me
     }
 }
 
-/// Prints how many of Aleph0's own pages EPT now hides from the guest.
-pub(super) fn hidden(hidden: Hidden) {
-    log!(
-        "Aleph0 pages hidden from the guest: {} data page(s) redirected to the EPT shadow, \
-         {} code page(s) read-only, {} region(s) split into a PT.",
-        hidden.data_pages,
-        hidden.code_pages,
-        hidden.regions_split,
-    );
-}
-
 /// Prints how the current page tables, which the guest will share, map the
 /// guest pages. Only called once all permission checks have passed.
 pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
@@ -294,30 +183,6 @@ pub(super) fn guest_mappings(guest: &GuestMemory, mappings: &GuestMappings) {
         cr4 & crate::x86::cr::CR4_SMEP != 0,
         cr4 & crate::x86::cr::CR4_SMAP != 0,
     );
-}
-
-/// Prints where the exit bitmaps are and what they intercept: the MSRs
-/// passed through, every MTRR address, of which the guest's copy holds
-/// those `mtrr` lists, and the ports.
-pub(super) fn exit_bitmaps(bitmaps: &ExitBitmaps, kind: GuestKind, mtrr: MtrrCapabilities) {
-    log!(
-        "Exit bitmaps allocated: MSR={:#018x} I/O A={:#018x} I/O B={:#018x}.",
-        bitmaps.msr_address(),
-        bitmaps.io_a_address(),
-        bitmaps.io_b_address(),
-    );
-    let (msrs, ports) = intercepted(kind);
-    log!("Intercepted MSRs (read and write) for the {kind:?} guest: {msrs:x?}; intercepted ports: {ports:x?}.");
-    let addresses = crate::x86::mtrr::every_msr_address().count();
-    match mtrr.msrs().count() {
-        0 => log!("Intercepted MTRR addresses (read and write): all {addresses}, which get #GP: the CPU has no MTRRs."),
-        count => log!(
-            "Intercepted MTRR addresses (read and write): all {addresses}. The guest reads and writes a copy of the {count} MSRs the CPU has (IA32_MTRR_DEF_TYPE, {} fixed-range MSRs and {} variable ranges); the other {} get #GP.",
-            if mtrr.fixed() { crate::x86::mtrr::FIXED_MSRS } else { 0 },
-            mtrr.variable_count(),
-            addresses - count,
-        ),
-    }
 }
 
 /// Prints what CPUID says of Hyper-V's interface (`detection`), and so what
@@ -365,17 +230,4 @@ pub(super) fn passthrough_state(before: PassthroughState, after: PassthroughStat
         "Passthrough state before the guest {before:x?}, after it {after:x?}: restored={}.",
         before == after
     );
-}
-
-/// Prints the guest state that was written to the VMCS. If VM entry later
-/// fails with "invalid guest state" (exit reason 33), these are the values
-/// the CPU rejected.
-pub(super) fn guest_state(state: &GuestState, entry: GuestEntry) {
-    state.report(format_args!("Guest"));
-    if let GuestEntry::InPlace { .. } = entry {
-        log!(
-            "Guest rip, rsp and rflags are placeholders: VMLAUNCH writes its own, and the code after it goes on as the guest."
-        );
-    }
-    log!("VMCS guest fields written and read back; VM entry not attempted.");
 }

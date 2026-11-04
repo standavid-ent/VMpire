@@ -1,15 +1,38 @@
-//! Unit tests for `src/vmx/exit_decision/emulation.rs`.
+//! Unit tests for `src/hv/exit_decision/emulation.rs`. The exits are
+//! written as the Intel backend reads them (`raw_exit::RawExit`).
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its
 //! private items.
 
+use super::super::raw_exit::RawExit;
 use super::*;
-use crate::hv::exit_decision::{
+use crate::hal::intel::vmexit::decode::{
     EXIT_REASON_CPUID, EXIT_REASON_IO_INSTRUCTION, EXIT_REASON_RDMSR, EXIT_REASON_WRMSR, EXIT_REASON_XSETBV,
-    ExitReason, InterruptionInfo,
+    ExitReason, InterruptionInfo, IoQualification,
 };
+use crate::hal::types::{CrConstraints, OptionalFeatures};
 use crate::x86::mtrr::{self, MtrrCapabilities};
+
+// The handlers on `exit` as the backend reads it.
+fn cpuid(exit: &RawExit) -> ExitEvent {
+    super::cpuid(&exit.info())
+}
+fn xsetbv(exit: &RawExit) -> ExitEvent {
+    super::xsetbv(&exit.info())
+}
+fn rdmsr(exit: &RawExit) -> ExitEvent {
+    super::rdmsr(&exit.info())
+}
+fn wrmsr(exit: &RawExit) -> ExitEvent {
+    super::wrmsr(&exit.info())
+}
+fn io(exit: &RawExit) -> ExitEvent {
+    super::io(&exit.info())
+}
+fn wrmsr_value(exit: &RawExit) -> u64 {
+    super::wrmsr_value(&exit.info())
+}
 
 /// CPUID leaf 1 as a Hyper-V guest with nested virtualization sees it: VMX
 /// (ECX bit 5) set.
@@ -21,8 +44,8 @@ const LEAF_1: CpuidResult = CpuidResult {
 };
 
 /// An exit with reason `basic` and every other field zero.
-fn exit(basic: u16) -> ExitInfo {
-    ExitInfo {
+fn exit(basic: u16) -> RawExit {
+    RawExit {
         reason: ExitReason {
             basic,
             entry_failure: false,
@@ -42,16 +65,21 @@ fn exit(basic: u16) -> ExitInfo {
         hyperv: false,
         guest_cpl: 0,
         cr_source: 0,
-        cr_fixed: crate::x86::cr::CrFixed::NONE,
+        cr_fixed: CrConstraints::NONE,
         guest_cr4: 0,
         xcr0_supported: 0,
     }
 }
 
-/// What Hyper-V offers (`features.rs` tests): every optional secondary
-/// control, and XSETBV with x87, SSE, AVX and AVX-512.
+/// What Hyper-V offers (`features.rs` tests): every optional feature, and
+/// XSETBV with x87, SSE, AVX and AVX-512.
 const OFFERED: GuestFeatures = GuestFeatures {
-    secondary: 0x0410_100A,
+    features: OptionalFeatures {
+        rdtscp: true,
+        invpcid: true,
+        xsaves: true,
+        waitpkg: true,
+    },
     xcr0: 0xE7,
 };
 /// Nothing beyond EPT, no XSETBV.
@@ -140,7 +168,7 @@ fn other_leaves_pass_through() {
 
 #[test]
 fn cpuid_takes_leaf_and_subleaf_from_the_low_halves_of_rax_and_rcx() {
-    let cpuid_exit = ExitInfo {
+    let cpuid_exit = RawExit {
         guest_rax: 0xFFFF_FFFF_0000_0007,
         guest_rcx: 0x0000_0001_0000_0001,
         guest_cr4: CR4_OSXSAVE,
@@ -158,8 +186,8 @@ fn cpuid_takes_leaf_and_subleaf_from_the_low_halves_of_rax_and_rcx() {
 
 /// An XSETBV of `value` (EDX:EAX) to XCR `xcr` on a CPU supporting
 /// `supported`.
-fn xsetbv_exit(xcr: u64, value: u64, supported: u64) -> ExitInfo {
-    ExitInfo {
+fn xsetbv_exit(xcr: u64, value: u64, supported: u64) -> RawExit {
+    RawExit {
         guest_rcx: xcr,
         guest_rax: value & 0xFFFF_FFFF,
         guest_rdx: value >> 32,
@@ -178,7 +206,7 @@ fn xsetbv_of_a_value_xcr0_takes_is_emulated() {
         );
     }
     // Only ECX names the XCR, and only EDX:EAX the value.
-    let high_halves = ExitInfo {
+    let high_halves = RawExit {
         guest_rcx: 0xFFFF_FFFF_0000_0000,
         guest_rax: 0xFFFF_FFFF_0000_0003,
         ..xsetbv_exit(0, 0, 0xE7)
@@ -224,8 +252,8 @@ fn without_xsetbv_in_root_operation_every_value_gets_gp() {
 
 const KERNEL_GS_BASE: u32 = 0xC000_0102;
 
-fn msr_exit(basic: u16, msr: u64, rax: u64, rdx: u64) -> ExitInfo {
-    ExitInfo {
+fn msr_exit(basic: u16, msr: u64, rax: u64, rdx: u64) -> RawExit {
+    RawExit {
         guest_rcx: msr,
         guest_rax: rax,
         guest_rdx: rdx,
@@ -272,8 +300,8 @@ fn msrs_outside_the_bitmap_get_a_general_protection_fault() {
 }
 
 /// `exit` from a guest that has Hyper-V's interface.
-fn under_hyperv(exit: ExitInfo) -> ExitInfo {
-    ExitInfo { hyperv: true, ..exit }
+fn under_hyperv(exit: RawExit) -> RawExit {
+    RawExit { hyperv: true, ..exit }
 }
 
 #[test]
@@ -396,8 +424,8 @@ fn io_qualification(port: u16, size_minus_1: u64, is_in: bool) -> u64 {
     (u64::from(port) << 16) | (u64::from(is_in) << 3) | size_minus_1
 }
 
-fn io_exit(qualification: u64, rax: u64) -> ExitInfo {
-    ExitInfo {
+fn io_exit(qualification: u64, rax: u64) -> RawExit {
+    RawExit {
         qualification,
         guest_rax: rax,
         ..exit(EXIT_REASON_IO_INSTRUCTION)
@@ -539,8 +567,8 @@ fn hyper_v_mtrrs() -> MtrrCapabilities {
 }
 
 /// An RDMSR or WRMSR exit of a guest with Hyper-V's MTRRs, writing `value`.
-fn mtrr_exit(basic: u16, msr: u32, value: u64) -> ExitInfo {
-    ExitInfo {
+fn mtrr_exit(basic: u16, msr: u32, value: u64) -> RawExit {
+    RawExit {
         mtrr: hyper_v_mtrrs(),
         ..msr_exit(basic, msr.into(), value & 0xFFFF_FFFF, value >> 32)
     }
@@ -605,7 +633,7 @@ fn mtrr_addresses_the_cpu_has_no_msr_at_get_a_general_protection_fault() {
         (MtrrCapabilities::NONE, 0x2FF),
         (MtrrCapabilities::NONE, 0x200),
     ] {
-        let access = |basic| ExitInfo {
+        let access = |basic| RawExit {
             mtrr,
             ..msr_exit(basic, msr, 0, 0)
         };
@@ -627,7 +655,7 @@ fn msrs_next_to_the_mtrrs_that_are_not_intercepted_mean_a_broken_bitmap() {
     // IA32_MTRRCAP stays the guest's, and 0x240 is past the variable ranges
     // Aleph0 keeps: neither should ever exit.
     for msr in [0xFE, 0x240] {
-        let access = |basic| ExitInfo {
+        let access = |basic| RawExit {
             mtrr: hyper_v_mtrrs(),
             ..msr_exit(basic, msr, 0, 0)
         };

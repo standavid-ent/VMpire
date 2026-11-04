@@ -1,4 +1,4 @@
-//! Unit tests for `src/vmx/hyperv.rs`.
+//! Unit tests for `src/hv/hyperv.rs`.
 //!
 //! Compiled only by `cargo test-host`. That file includes this one with
 //! `#[path]` as its child module `tests`, so `use super::*` reaches its
@@ -6,6 +6,7 @@
 //! the recovery points are checked against their bytes.
 
 use super::*;
+use crate::hal::backend;
 
 /// CPUID.1:ECX as Hyper-V showed it to Aleph0 (ROADMAP.md), bit 31 set.
 const HYPERV_LEAF1_ECX: u32 = 0xf7fa_3223;
@@ -89,12 +90,9 @@ fn address(label: *const u8) -> u64 {
 
 #[test]
 fn each_forwarding_instruction_recovers_from_its_own_exception() {
+    let hypercall = backend::Hypercall::recovery_point();
     for (instruction, vector, refused) in [
-        (
-            &raw const hyperv_hypercall_instruction,
-            INVALID_OPCODE,
-            &raw const hyperv_hypercall_refused,
-        ),
+        (hypercall.instruction, hypercall.vector, hypercall.resume),
         (
             &raw const hyperv_rdmsr_instruction,
             GENERAL_PROTECTION,
@@ -135,7 +133,7 @@ fn the_recovery_points_sit_on_the_instructions() {
     // instruction is at least as long as the bytes read.
     let (vmcall, rdmsr, wrmsr) = unsafe {
         (
-            *(&raw const hyperv_hypercall_instruction).cast::<[u8; 3]>(),
+            *backend::Hypercall::recovery_point().instruction.cast::<[u8; 3]>(),
             *(&raw const hyperv_rdmsr_instruction).cast::<[u8; 2]>(),
             *(&raw const hyperv_wrmsr_instruction).cast::<[u8; 2]>(),
         )

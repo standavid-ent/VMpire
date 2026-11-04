@@ -24,10 +24,10 @@
 //! its type, as they do for the firmware. Accessed and dirty are set from
 //! the start, so the CPU never writes the tables.
 
-use crate::hal::intel::ept::level::{Level, Pd, Pdpt, Pml4, TableLevel};
-use crate::hal::intel::ept::{PDPT_SPAN, SIZE_1G};
 use crate::x86::cr::CR4_LA57;
 use crate::x86::page::{PAGE_SIZE, allocate_zeroed_pages};
+use crate::x86::paging::level::{Level, Pd, Pdpt, Pml4, TableLevel};
+use crate::x86::paging::{PDPT_SPAN, SIZE_1G};
 use core::marker::PhantomData;
 
 /// Entry bit 0 (P): the entry is used.

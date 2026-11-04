@@ -52,7 +52,6 @@
 use core::ptr::NonNull;
 
 use super::vmexit::VcpuStats;
-use crate::hal::intel::ept::SIZE_2M;
 use crate::hv::exit_decision::NMI_VECTOR;
 use crate::hv::features::CPUID_1_ECX_OSXSAVE;
 use crate::x86::apic::{APIC_BASE_MODE, APIC_BASE_XAPIC, IA32_APIC_BASE, INTEGRATED_APIC_VERSIONS, LAPIC_VERSION};
@@ -61,6 +60,7 @@ use crate::x86::cr::{self, read_cr4};
 use crate::x86::msr::IA32_KERNEL_GS_BASE;
 use crate::x86::mtrr::{self, IA32_MTRR_PHYSBASE0, IA32_MTRRCAP, PHYSMASK_VALID};
 use crate::x86::page::{PAGE_SIZE, RESIDENT_CODE, allocate_zeroed_page, allocate_zeroed_pages_of_type};
+use crate::x86::paging::SIZE_2M;
 use crate::x86::paging::{self, Mapping, WalkError};
 use crate::x86::segment::{self, DescriptorTable, GATE_SIZE};
 
@@ -156,6 +156,9 @@ pub fn expected_stats(actual: &VcpuStats) -> VcpuStats {
     }
 }
 
+// The guest program, in the backend's instructions: Intel's exits to
+// Aleph0 with VMCALL. Only the selected backend's program is built.
+#[cfg(feature = "intel")]
 core::arch::global_asm!(
     r#"
     .globl guest_code_start

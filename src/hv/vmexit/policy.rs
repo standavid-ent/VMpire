@@ -22,7 +22,7 @@
 
 use core::fmt;
 
-use crate::hv::exit_decision::exit_reason_name;
+use crate::hal::{VmExit, backend};
 
 /// How much a report line matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -82,19 +82,20 @@ pub fn exit_detail(count: u64, stops: bool, unreadable: bool, milestone: bool, m
     }
 }
 
-/// Basic exit reasons with a counter of their own: 0 to 127, well past the
-/// highest the SDM defines.
-pub const REASON_COUNTERS: usize = 128;
-/// The counter every other reason shares: one past the SDM's, or
-/// `UNREADABLE_REASON` (`0xFFFF`) when VM_EXIT_REASON could not be read.
+/// Reason numbers with a counter of their own: the backend's
+/// (`VmExit::REASON_COUNTERS`; on Intel 0 to 127, well past the highest the
+/// SDM defines).
+pub const REASON_COUNTERS: usize = <backend::VmExit as VmExit>::REASON_COUNTERS;
+/// The counter every other reason shares: past the backend's, or when the
+/// exit's reason could not be read.
 pub const OTHER_REASONS: usize = REASON_COUNTERS;
 /// Counters in all.
 pub const COUNTERS: usize = REASON_COUNTERS + 1;
 
-/// The counter of basic exit reason `basic`. Never past the last one,
-/// whatever `basic` is.
-pub fn counter(basic: u16) -> usize {
-    usize::from(basic).min(OTHER_REASONS)
+/// The counter of reason number `number` (`ReasonDescription::number`).
+/// Never past the last one, whatever `number` is.
+pub fn counter(number: u16) -> usize {
+    usize::from(number).min(OTHER_REASONS)
 }
 
 /// The exit counts by reason, as the line every stop prints:
@@ -113,7 +114,11 @@ impl fmt::Display for Histogram<'_> {
             if slot == OTHER_REASONS {
                 write!(f, "{separator}other={count}")?;
             } else {
-                write!(f, "{separator}{slot} ({})={count}", exit_reason_name(slot as u16))?;
+                write!(
+                    f,
+                    "{separator}{slot} ({})={count}",
+                    backend::VmExit::describe_reason(slot as u32).name
+                )?;
             }
             separator = ", ";
         }

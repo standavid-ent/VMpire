@@ -5,7 +5,7 @@
 //! private items.
 
 use super::*;
-use crate::hv::exit_decision::UNREADABLE_REASON;
+use crate::hal::intel::vmexit::decode::UNREADABLE_REASON;
 
 /// The details of exits 1 to `last` of one reason, none of which stops the
 /// guest, in a build printing up to `max_level`.

@@ -16,7 +16,7 @@
 //! docs/CONTROL_REGISTERS.md.
 use core::arch::asm;
 
-use crate::x86::msr;
+use crate::hal::types::CrConstraints;
 
 /// CR0 bit 0 (PE): protected mode. Clearing it (leaving protected mode)
 /// needs an unrestricted guest, which Aleph0 does not enable.
@@ -117,61 +117,6 @@ pub unsafe fn xsetbv(value: u64) {
     };
 }
 
-/// The IA32_VMX_CR0/CR4_FIXED0/FIXED1 MSRs: the CR0 and CR4 bits VMX
-/// operation fixes. A bit set in FIXED0 must be 1; a bit clear in FIXED1 must
-/// be 0. The guest/host masks, read shadows ([`CrControls`]) and the
-/// reason-28 decision (`exit_decision::control_register`) all follow from them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CrFixed {
-    pub cr0_fixed0: u64,
-    pub cr0_fixed1: u64,
-    pub cr4_fixed0: u64,
-    pub cr4_fixed1: u64,
-}
-
-impl CrFixed {
-    /// All zero: no bit fixed. A placeholder for exits that are not
-    /// control-register accesses, which `exit_decision::decide` never reads
-    /// it for.
-    pub const NONE: Self = Self {
-        cr0_fixed0: 0,
-        cr0_fixed1: 0,
-        cr4_fixed0: 0,
-        cr4_fixed1: 0,
-    };
-
-    /// Reads the four MSRs.
-    ///
-    /// # Safety
-    ///
-    /// The CPU must support VMX, so the FIXED MSRs exist (checked before
-    /// VMXON, and still true in exit context).
-    pub unsafe fn read() -> Self {
-        // SAFETY: the caller guarantees VMX support, so the FIXED MSRs exist
-        // and reading them has no side effects.
-        unsafe {
-            Self {
-                cr0_fixed0: msr::rdmsr(msr::IA32_VMX_CR0_FIXED0),
-                cr0_fixed1: msr::rdmsr(msr::IA32_VMX_CR0_FIXED1),
-                cr4_fixed0: msr::rdmsr(msr::IA32_VMX_CR4_FIXED0),
-                cr4_fixed1: msr::rdmsr(msr::IA32_VMX_CR4_FIXED1),
-            }
-        }
-    }
-
-    /// The CR0 bits VMX operation fixes, so the guest/host mask owns them
-    /// (typically PE, NE and PG).
-    pub fn cr0_owned(self) -> u64 {
-        owned(self.cr0_fixed0, self.cr0_fixed1)
-    }
-
-    /// The CR4 bits VMX operation fixes, so the guest/host mask owns them
-    /// (CR4.VMXE among them).
-    pub fn cr4_owned(self) -> u64 {
-        owned(self.cr4_fixed0, self.cr4_fixed1)
-    }
-}
-
 /// The bits VMX operation fixes, from one register's FIXED0/FIXED1: the
 /// must-be-1 bits (FIXED0) and the must-be-0 bits (`!FIXED1`). The guest must
 /// not freely change them, so the guest/host mask owns exactly these.
@@ -221,10 +166,11 @@ pub struct CrControls {
 }
 
 impl CrControls {
-    /// From the FIXED MSRs, the guest's CR0/CR4 (the host's, which the guest
-    /// state copies, so VMXE is set) and the CR0/CR4 from before VMXON
-    /// (`original_*`, VMXE clear), which `VmxOperation` keeps.
-    pub fn new(fixed: CrFixed, guest_cr0: u64, guest_cr4: u64, original_cr0: u64, original_cr4: u64) -> Self {
+    /// From the bits root mode fixes (`fixed`), the guest's CR0/CR4 (the
+    /// host's, which the guest state copies, so the enable bit is set) and
+    /// the CR0/CR4 from before root mode (`original_*`, enable bit clear),
+    /// which `HardwareVirtualization` keeps.
+    pub fn new(fixed: CrConstraints, guest_cr0: u64, guest_cr4: u64, original_cr0: u64, original_cr4: u64) -> Self {
         let cr0_mask = fixed.cr0_owned();
         let cr4_mask = fixed.cr4_owned();
         Self {

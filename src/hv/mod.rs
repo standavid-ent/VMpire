@@ -7,5 +7,6 @@ pub mod exit_decision;
 pub mod features;
 pub mod guest;
 pub mod hyperv;
+pub mod intercepted;
 pub mod vmcall;
 pub mod vmexit;

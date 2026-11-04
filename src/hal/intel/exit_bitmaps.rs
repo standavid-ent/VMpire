@@ -26,35 +26,15 @@
 
 use core::ptr::NonNull;
 
+use crate::hal::intel::msr::{
+    IA32_BNDCFGS, IA32_DEBUGCTL, IA32_EFER, IA32_FS_BASE, IA32_GS_BASE, IA32_PAT, IA32_PERF_GLOBAL_CTRL,
+    IA32_SYSENTER_CS, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP,
+};
 use crate::hal::intel::vmcs::fields::{IO_BITMAP_A, IO_BITMAP_B, MSR_BITMAP};
 use crate::hal::intel::vmcs::{self, GuestKind, VmcsError};
-use crate::hv::guest::GUEST_SCRATCH_PORT;
-use crate::x86::msr::{
-    IA32_BNDCFGS, IA32_DEBUGCTL, IA32_EFER, IA32_FS_BASE, IA32_GS_BASE, IA32_KERNEL_GS_BASE, IA32_PAT,
-    IA32_PERF_GLOBAL_CTRL, IA32_SYSENTER_CS, IA32_SYSENTER_EIP, IA32_SYSENTER_ESP,
-};
+use crate::hv::intercepted::{INTERCEPTED_MSRS, intercepted};
 use crate::x86::mtrr;
 use crate::x86::page::{PAGE_SIZE, allocate_zeroed_page};
-
-/// MSRs whose RDMSR and WRMSR exit to Aleph0 in the test guest, which passes
-/// them through: it runs a real RDMSR/WRMSR in root operation, which reaches
-/// the CPU's own MSR, so none may be in [`VMCS_HELD_MSRS`] (checked at compile
-/// time below). They test the bitmap and the passthrough (`crate::hv::guest`); for
-/// the firmware or an OS each exit would only repeat the access, so they do
-/// not exit there ([`ExitBitmaps::allocate`]).
-///
-/// The MTRR MSRs exit too ([`ExitBitmaps::allocate`]), but are never
-/// passed through: the guest reads and writes a copy of them
-/// (`vmexit::guest_mtrrs`), since the CPU's still set the memory types of
-/// Aleph0's own accesses. Every address an MTRR can have exits
-/// ([`mtrr::every_msr_address`]), not only those the CPU has, so the guest
-/// gets #GP for the others from Aleph0 rather than from whatever the CPU
-/// holds there.
-pub const INTERCEPTED_MSRS: [u32; 1] = [IA32_KERNEL_GS_BASE];
-
-/// Ports whose IN and OUT exit to Aleph0 in the test guest, like
-/// [`INTERCEPTED_MSRS`].
-pub const INTERCEPTED_PORTS: [u16; 1] = [GUEST_SCRATCH_PORT];
 
 /// MSRs whose guest value is a VMCS guest-state field. In root operation a
 /// real RDMSR/WRMSR reaches the host's value, not the guest's, so an
@@ -128,16 +108,6 @@ pub const fn io_bit(port: u16) -> (IoBitmap, usize, u8) {
     (page, index / 8, (port % 8) as u8)
 }
 
-/// The MSRs and ports a `kind` guest's RDMSR, WRMSR, IN and OUT exit for
-/// besides the MTRRs: [`INTERCEPTED_MSRS`] and [`INTERCEPTED_PORTS`] for the
-/// test guest, none for the firmware.
-pub fn intercepted(kind: GuestKind) -> (&'static [u32], &'static [u16]) {
-    match kind {
-        GuestKind::BuiltInTest => (&INTERCEPTED_MSRS, &INTERCEPTED_PORTS),
-        GuestKind::Firmware => (&[], &[]),
-    }
-}
-
 /// Sets, in zeroed bitmap pages, the bits of every address an MTRR MSR can
 /// have (read and write), and of the MSRs and ports [`intercepted`] gives a
 /// `kind` guest.
@@ -179,7 +149,7 @@ pub struct ExitBitmaps {
 impl ExitBitmaps {
     /// Allocates three zeroed pages and sets the bits a `kind` guest exits
     /// for ([`fill`]): every address an MTRR MSR can have, and for the test
-    /// guest [`INTERCEPTED_MSRS`] and [`INTERCEPTED_PORTS`]. The firmware's
+    /// guest [`INTERCEPTED_MSRS`] and `INTERCEPTED_PORTS`. The firmware's
     /// I/O bitmaps stay all zero, so its IN, OUT, INS and OUTS never exit,
     /// and of its MSRs in the two ranges only the MTRRs do.
     pub fn allocate(kind: GuestKind) -> Result<Self, ExitBitmapsError> {

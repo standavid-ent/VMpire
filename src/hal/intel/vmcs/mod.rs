@@ -35,8 +35,8 @@
 
 use crate::hal::intel::ept::Eptp;
 use crate::hal::intel::instruction::{VmxFail, check_rflags, vmx_asm};
+use crate::hal::intel::msr::{self, UnsupportedControl, VmcsControlMsrs};
 use crate::hal::intel::region::VmxRegion;
-use crate::x86::msr::{self, UnsupportedControl, VmcsControlMsrs};
 use crate::x86::{cr, segment};
 use core::arch::asm;
 
@@ -86,40 +86,7 @@ impl DesiredControls {
     }
 }
 
-/// Which guest Aleph0 runs. The kind decides where the guest starts
-/// (`guest_state::GuestEntry`), which exceptions exit ([`exception_bitmap`]),
-/// how its exits are decided (`exit_decision::decide`), and where a stop
-/// ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuestKind {
-    /// Aleph0's built-in test guest (`crate::hv::guest`), the regression mode. Its
-    /// IDT has only the NMI gate, and its scripted VMCALLs end the run. A
-    /// stop returns to bring-up ([`launch`]), and bring-up then leaves VMX
-    /// operation.
-    BuiltInTest,
-    /// The running firmware, virtualized in place ([`launch_in_place`]). It
-    /// has its own full IDT and handles its own faults. It never finishes,
-    /// and a stop halts: the firmware has reused the stack the launch ran
-    /// on.
-    Firmware,
-}
-
-impl GuestKind {
-    /// The guest this build runs: the built-in test guest with the
-    /// `test-guest` Cargo feature, the firmware otherwise.
-    pub const SELECTED: Self = if cfg!(feature = "test-guest") {
-        Self::BuiltInTest
-    } else {
-        Self::Firmware
-    };
-
-    /// Whether a stop of this guest returns to bring-up, through the frame
-    /// [`launch`] saved. [`launch_in_place`] saves none, so a stop of the
-    /// firmware halts.
-    pub const fn stop_returns_to_bring_up(self) -> bool {
-        matches!(self, Self::BuiltInTest)
-    }
-}
+pub use crate::hal::types::GuestKind;
 
 /// The exception bitmap for `kind`.
 ///
@@ -475,29 +442,7 @@ pub unsafe fn configure_controls(capabilities: &VmcsControlMsrs, desired: Desire
     Ok(())
 }
 
-/// The selectors a VM exit loads into the host's segment registers and TR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostSelectors {
-    pub cs: u16,
-    pub ss: u16,
-    pub ds: u16,
-    pub es: u16,
-    pub fs: u16,
-    pub gs: u16,
-    pub tr: u16,
-}
-
-/// The host state Aleph0 builds itself (`crate::host`) instead of taking it
-/// from the running firmware: page tables, descriptor tables, and the
-/// selectors that index them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HostTables {
-    pub cr3: u64,
-    pub gdtr_base: u64,
-    pub idtr_base: u64,
-    pub tr_base: u64,
-    pub selectors: HostSelectors,
-}
+pub use crate::hal::types::HostTables;
 
 /// Write the host state to the current VMCS: `tables` for CR3, the
 /// descriptor tables and the selectors; `cr4` for CR4; the running CPU for
