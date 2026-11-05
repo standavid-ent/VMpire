@@ -43,7 +43,7 @@ extern crate alloc;
 #[path = "../../../src/resident/memory.rs"]
 mod memory;
 #[allow(dead_code)]
-#[path = "../../../src/vmx/vmcall.rs"]
+#[path = "../../../src/hv/vmcall.rs"]
 mod vmcall;
 
 mod paging;
